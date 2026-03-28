@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '0 0 * * *'    # UTC 00:00 = 北京时间 08:00
   #   - cron: '0 12 * * *'   # UTC 12:00 = 北京时间 20:00
+
+  repository_dispatch:
+    types:
+      - weread-bot-reading
   
   # 拉取请求触发，用于测试阅读
   pull_request:
