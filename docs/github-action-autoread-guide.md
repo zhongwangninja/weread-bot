@@ -6,34 +6,45 @@
 
 ## 独立每周领奖 Actions
 
-`Weekly Rewards`（`.github/workflows/weekly-gain.yml`）与下面的自动阅读 workflow 完全独立，不需要 `WEREAD_CURL_STRING`。默认不开启、不在 PR 或 push 时运行；现有自动阅读任务不会自动领奖。
+`Weekly Rewards`（`.github/workflows/weekly-gain.yml`）与下面的自动阅读 workflow 完全独立，不需要 `WEREAD_CURL_STRING`。此 workflow 默认启用、直接领取，定时为**北京时间每周日 03:00 和 12:00**；不在 PR 或 push 时运行，现有自动阅读任务不会自动领奖。独立 CLI 和 `config.yaml.example` 的 `gain.enabled` 默认仍为 `false`，仅此 workflow 显式传入启用值。
 
-### 配置与手动验证
+### 配置与运行
 
 在 **Settings → Secrets and variables → Actions** 设置：
 
 | 类型 | 名称 | 说明 |
 |------|------|------|
-| Secret | `GAIN_REFRESH_TOKEN` | 自己的应用端 `/login` 请求体里的 RefreshToken |
+| Secret | `GAIN_REFRESH_TOKEN` | 自己的应用端 RefreshToken，可从 `/login` 请求体或成功响应获取 |
 | Secret | `GAIN_DEVICE_ID` | 与上述 Token 配对的 DeviceId |
-| Variable | `GAIN_ENABLED` | 可选，设为小写 `true` 长期开启；仅调试时可不设置，手动勾选 `enable_once` 开启本次 |
+| Secret | `APPRISE_URL` | 可选，复用自动阅读的 Apprise 通知 URL；未配置则跳过通知 |
+| Secret | `NOTIFICATION_ONLY_ON_FAILURE` | 可选，复用自动阅读的开关，默认 `false`；设为 `true` 时只通知失败/中断等非成功结果 |
+| Variable | `GAIN_ENABLED` | 可选，默认 `true`；设为小写 `false` 停止后续手动和定时领奖 job |
 | Variable | `GAIN_TYPE` | 可选，默认 `2`（书币），`1` 为卡类奖励 |
 
-1. 进入 **Actions → Weekly Rewards → Run workflow**。只配置了两个 Secrets 时，勾选 `enable_once`，显式开启本次调试；它不会修改仓库 Variable，也不会开启后续定时任务。不勾选且没有 `GAIN_ENABLED=true` 时，job 安全跳过。
-2. 保持 `operation=query`（默认），只登录并查询档位，不领取。`reward_type=default` 使用仓库 Variable，未配置则书币；手动选择 `2` 或 `1` 可覆盖本次选择。
-3. 确认应用端登录和选项结构兼容后，再显式选择 `operation=claim`，并再次勾选 `enable_once` 或设置仓库 `GAIN_ENABLED=true`。它会领取所有可领取且支持所选奖励的档位，不自动回退到另一种奖励。首次建议只有一个可领取档位时试跑，并在 App 核实。
+配置凭据后，进入 **Actions → Weekly Rewards → Run workflow** 即可执行领取，无需填写调试参数。手动和定时运行都使用仓库 `GAIN_TYPE`，会先查询，再领取所有可领取且支持所选奖励的档位，不自动回退到另一种奖励。只想查询时，请在开发版本中使用独立 CLI 的 `--gain-query`，此正式 workflow 不提供查询模式。
 
-workflow 使用环境变量运行，不生成含凭据的配置，不读取仓库里的阅读配置。Secret 仅注入执行步骤，不输出原值，也不上传登录响应/配置。任务结束后尽力上传 `logs/weekly-gain.log`，保留 7 天；第一版不发送业务通知，不生成领奖历史文件。失败、部分失败、跳过不支持的奖励或待确认使 job 失败，请检查日志，不要只凭绿色状态认定余额增加。
+workflow 使用环境变量运行，不生成含凭据的配置，不读取仓库里的阅读配置。凭据 Secret 仅注入领取步骤，不输出原值，也不上传登录响应/配置。任务结束后尽力上传 `logs/weekly-gain.log`，保留 7 天，不生成领奖历史文件。失败、部分失败、跳过不支持的奖励或待确认使 job 失败，请检查日志；回查确认的是档位状态，不要只凭绿色状态认定余额增加。
 
-### 开启定时与运行边界
+### Apprise 通知
 
-完成验证后，取消该 workflow 的 `schedule` 注释即可每天运行一次领取，示例 UTC 01:17 为北京时间 09:17。仍须保留 `GAIN_ENABLED=true`；定时触发使用仓库 `GAIN_TYPE`，不是上一次手动选择。
+通知步骤复用现有依赖中的 Apprise CLI，支持 Apprise 各类通知 URL。通知包含任务结果、仓库名和 Actions 运行链接，详细档位结果查看脱敏日志。URL 仅从环境变量传入，不写入文件或命令参数，第三方通知原始输出也不会进入 Actions 日志。
 
-- 新的手动 workflow 需先存在于默认分支，之后才可在界面选择分支运行；定时仅运行默认分支版本。新功能分支先离线测试，勿为测试添加自动 PR 领取触发器。
+`NOTIFICATION_ONLY_ON_FAILURE=true` 时跳过成功通知；未配置 `APPRISE_URL` 时安静跳过。通知步骤尽力在任务结束后执行，失败不会改变领取步骤的结果，也不会重试领取。独立 CLI 本身仍不发送通知。
+
+### 定时与开发分支业务版本
+
+| 任务 | 北京时间 | UTC cron |
+|------|----------|----------|
+| 自动阅读（`auto-reading-scheduled.yml`） | 每天 01:00 | `0 17 * * *` |
+| 独立领奖（`weekly-gain.yml`） | 每周日 03:00 | `0 19 * * 6` |
+| 独立领奖（`weekly-gain.yml`） | 每周日 12:00 | `0 4 * * 0` |
+
+定时触发要求 workflow 存在于默认分支。观察期可以**只将 workflow 合并到 `main`，不合并领奖业务代码**：领奖 workflow 的 `actions/checkout.ref` 指向 `feat/standalone-weekly-gain`，每次运行都会检出该分支最新推送的业务代码，无需更新 workflow 中的 ref。请先测试再推送，该分支的新代码会影响下一次自动领奖；分支需持续保留。仅在 Run workflow 选择其他分支不会覆盖这里指定的业务分支。修改开发分支的 workflow 文件不会自动更新 `main` 的定时定义，仍需单独合并相应 workflow 改动。
+
 - GitHub 定时任务可能延迟或漏跑；公开仓库长期无活动也可能暂停定时，避免仅在奖励过期前的最后几分钟运行。
 - 固定并发组 `weread-weekly-gain` 跨分支防止该 workflow 重叠，`cancel-in-progress: false` 不取消正在运行的任务。它不能协调其他仓库或青龙任务，请勿用同一账号并行领取。
-- 任务超时 10 分钟；取消运行或 runner 退出不能撤销已发送的请求。脚本不自动重放领取请求，待确认时先在 App 检查；重新运行也会先查询状态。
-- GitHub-hosted runner 的网络与无签名登录兼容性需实际查询验证，不能用本地/单元测试结果替代。
+- 任务超时 10 分钟；关闭开关、取消运行或 runner 退出不能撤销已发送的请求。脚本不自动重放领取请求，待确认时先在 App 检查；重新运行也会先查询状态。
+- GitHub-hosted runner 的网络与无签名登录兼容性需实际验证，不能用本地/单元测试结果替代。
 - Secrets 不会自动刷新，RefreshToken 失效或轮换后需手动重新获取并更新。仅需 `contents: read`，不授予写仓库/修改 Secrets 权限。
 
 ## 🚀 快速开始
@@ -217,17 +228,17 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
    - **启用执行历史**: 是否在运行后保存最近执行记录
    - **历史保留条数**: 最近执行记录最多保留多少条
 
-#### 定时触发（可选）
+#### 定时触发
 
-Fork 后默认不会自动定时运行，因为仓库中的 `.github/workflows/auto-reading.yml` 仍然把 `schedule` 注释掉了。若希望自动定时运行，必须先取消该注释，再按需要调整 cron 表达式：
+`.github/workflows/auto-reading-scheduled.yml`（**Auto Reading Bot Scheduled**）已配置北京时间每天 **01:00** 自动阅读。确保该文件存在于默认分支且 Actions 已启用，cron 使用 UTC：
 
 ```yaml
 on:
-  # 取消注释以下行启用定时触发
   schedule:
-    - cron: '0 0 * * *'    # UTC 00:00 = 北京时间 08:00
-    - cron: '0 12 * * *'   # UTC 12:00 = 北京时间 20:00
+    - cron: '0 17 * * *'   # UTC 前一天 17:00 = 北京时间当天 01:00
 ```
+
+另一个 `.github/workflows/auto-reading.yml` 的示例 `schedule` 仍为注释状态。不要同时启用两份定时阅读配置，以免同一账号重叠运行；如需调整时间，修改已启用的 `auto-reading-scheduled.yml` 即可。
 
 ## ⚙️ 配置参数说明
 
@@ -333,7 +344,7 @@ A: 是的，GitHub 免费账户每月有 2000 分钟的 Actions 使用时间。�
 
 ### Q: 如何设置定时运行？
 
-A: 先取消 `.github/workflows/auto-reading.yml` 中 `schedule` 部分的注释，并根据需要调整 cron 表达式。注意时间为 UTC 时间。如果你 fork 后不想继续改代码，但想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
+A: `.github/workflows/auto-reading-scheduled.yml` 已配置北京时间每天 01:00 运行，合并到默认分支并启用 Actions 即可；修改 cron 时注意使用 UTC，避免再启用另一份重复定时配置。独立领奖为北京时间每周日 03:00 和 12:00，见上文。如果只想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
 
 ### Q: GitHub Actions 里的执行历史保存在哪里？
 

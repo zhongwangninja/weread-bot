@@ -293,10 +293,10 @@ python weread-bot.py --config config.yaml --gain-only
 - 在限速等待后再次检查取消和周期；临近北京时间周边界时预留四倍网络超时的窗口，不发起新的领取（默认最后两分钟）。收到中断信号会取消等待/在途任务，但不能撤销服务端已处理的请求。
 - 回查确认的是档位已领取，不等于独立验证书币余额增加。首次真实领取建议仅有一个可领取档位时试跑，并在 App 人工核实。
 - 成功查询、无可领取档位或所有领取已确认退出 `0`；失败、部分失败、不支持所选奖励或待确认退出 `1`；中断退出 `130`。
-- 第一版只输出脱敏日志，不发送通知、不写阅读历史，`--show-last-run` 不显示领奖结果；不修改、派生或续期网页 Cookie。
+- 独立 CLI 只输出脱敏日志，不发送通知、不写阅读历史，`--show-last-run` 不显示领奖结果；不修改、派生或续期网页 Cookie。Actions 另有独立的 Apprise 通知步骤。
 - RefreshToken 若发生轮换，仅保留在当前进程；下一次登录失败时须重新获取并更新本地配置/Secrets，不自动写回凭据。
 
-Actions 使用独立的 `Weekly Rewards` workflow，默认关闭且手动默认只查询，详见 [独立领奖 Actions 配置](docs/github-action-autoread-guide.md#独立每周领奖-actions)。青龙请创建单独任务，见 [独立每周领奖任务](docs/qinglong-guide.md#独立每周领奖任务)。
+Actions 使用独立的 `Weekly Rewards` workflow，**默认启用并领取书币**，北京时间每周日 **03:00 和 12:00** 执行；可设置仓库 Variable `GAIN_ENABLED=false` 关闭。复用 Secret `APPRISE_URL` 和 `NOTIFICATION_ONLY_ON_FAILURE` 发送任务结果通知；检出 `feat/standalone-weekly-gain` 分支最新推送的业务代码，支持只把 workflow 合并到 `main`。详见 [独立领奖 Actions 配置](docs/github-action-autoread-guide.md#独立每周领奖-actions)。青龙请创建单独任务，仍需显式开启，见 [独立每周领奖任务](docs/qinglong-guide.md#独立每周领奖任务)。
 
 协议参考：[tophtab 的领奖实现](https://github.com/tophtab/weread-bot/commit/2654110fc53784c265e987427dc8ac1ca666998b)。奖励选项 `choiceType` / `canChoice` / `awardNum` 结构参考 [scripts-hub](https://github.com/Zzz210s/scripts-hub/blob/8dcd99c602cd1a5b44cdd147799d81761e8a9d70/proj-weread-signin/src/weekly.js) 和 [WeRead-Kit](https://github.com/27Aaron/WeRead-Kit/blob/faf169d8ce573d9a6a2700f207549c775289b340/internal/weread/weekly.go)；不依赖这些项目的运行时服务。
 

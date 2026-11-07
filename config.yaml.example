@@ -12,6 +12,8 @@ app:
   max_concurrent_users: 1
 
 # 独立应用端每周领奖：只有 --gain-query / --gain-only 读取此段，普通阅读不会领奖。
+# 本地/青龙默认关闭；Weekly Rewards workflow 默认显式启用，不读取本配置。
+# Actions 单独复用 APPRISE_URL 和 NOTIFICATION_ONLY_ON_FAILURE 发送通知，CLI 不通知。
 # 凭据来自手机/墨水屏应用端 /login 抓包，与网页 CURL 无关；勿提交个人凭据。
 gain:
   enabled: false             # 必须显式开启；提供凭据不会自动开启。环境变量：GAIN_ENABLED

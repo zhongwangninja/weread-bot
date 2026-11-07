@@ -3,10 +3,13 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -783,36 +786,81 @@ class GainCliTests(unittest.IsolatedAsyncioTestCase):
 
 class GainWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        path = (
-            Path(__file__).resolve().parents[1]
-            / ".github/workflows/weekly-gain.yml"
-        )
+        self.root = Path(__file__).resolve().parents[1]
+        path = self.root / ".github/workflows/weekly-gain.yml"
         # BaseLoader 保留 GitHub 的 on 键，不按 YAML 1.1 解析成布尔值。
         self.workflow = yaml.load(
             path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
         )
-
-    def test_workflow_is_manual_and_default_disabled(self) -> None:
-        self.assertEqual(set(self.workflow["on"]), {"workflow_dispatch"})
-        inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
-        self.assertEqual(inputs["enable_once"]["type"], "boolean")
-        self.assertEqual(inputs["enable_once"]["default"], "false")
-        self.assertEqual(inputs["operation"]["default"], "query")
-        self.assertEqual(inputs["reward_type"]["default"], "default")
-        job = self.workflow["jobs"]["gain"]
-        enabled = (
-            "${{ vars.GAIN_ENABLED == 'true' || "
-            "(github.event_name == 'workflow_dispatch' "
-            "&& inputs.enable_once == true) }}"
+        self.steps = self.workflow["jobs"]["gain"]["steps"]
+        self.runtime = next(
+            step for step in self.steps if step.get("id") == "claim"
         )
-        self.assertEqual(job["if"], enabled)
-        runtime = next(
+        self.notification = next(
             step
-            for step in job["steps"]
-            if "GAIN_ENABLED" in step.get("env", {})
+            for step in self.steps
+            if step["name"] == "Send Apprise notification"
         )
-        self.assertEqual(runtime["env"]["GAIN_ENABLED"], enabled)
+
+    def test_workflow_defaults_to_enabled_claim_without_debug_inputs(
+        self,
+    ) -> None:
+        self.assertEqual(
+            set(self.workflow["on"]), {"workflow_dispatch", "schedule"}
+        )
+        self.assertEqual(self.workflow["on"]["workflow_dispatch"], {})
+        job = self.workflow["jobs"]["gain"]
+        self.assertEqual(job["if"], "${{ vars.GAIN_ENABLED != 'false' }}")
+        self.assertEqual(
+            self.runtime["env"]["GAIN_ENABLED"],
+            "${{ vars.GAIN_ENABLED || 'true' }}",
+        )
+        self.assertEqual(
+            self.runtime["env"]["GAIN_TYPE"], "${{ vars.GAIN_TYPE || '2' }}"
+        )
+        self.assertIn("--gain-only", self.runtime["run"])
+        self.assertNotIn("--gain-query", self.runtime["run"])
+        self.assertNotIn("inputs.", str(self.workflow))
         self.assertEqual(job["timeout-minutes"], "10")
+
+    def test_schedules_are_sunday_three_and_twelve_in_beijing(self) -> None:
+        crons = [entry["cron"] for entry in self.workflow["on"]["schedule"]]
+        self.assertEqual(crons, ["0 19 * * 6", "0 4 * * 0"])
+        beijing = timezone(timedelta(hours=8))
+        for cron, day, hour in zip(crons, (7, 8), (3, 12)):
+            with self.subTest(cron=cron):
+                minute, utc_hour, _, _, weekday = cron.split()
+                utc = datetime(
+                    2026,
+                    11,
+                    day,
+                    int(utc_hour),
+                    int(minute),
+                    tzinfo=timezone.utc,
+                )
+                self.assertEqual(utc.isoweekday() % 7, int(weekday))
+                local = utc.astimezone(beijing)
+                self.assertEqual(local.isoweekday(), 7)
+                self.assertEqual((local.hour, local.minute), (hour, 0))
+
+    def test_reading_schedule_is_daily_one_in_beijing(self) -> None:
+        path = self.root / ".github/workflows/auto-reading-scheduled.yml"
+        reading = yaml.load(
+            path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+        )
+        self.assertEqual(reading["on"]["schedule"], [{"cron": "0 17 * * *"}])
+        utc = datetime(2026, 11, 7, 17, tzinfo=timezone.utc)
+        local = utc.astimezone(timezone(timedelta(hours=8)))
+        self.assertEqual((local.day, local.hour, local.minute), (8, 1, 0))
+
+    def test_checkout_tracks_latest_development_branch(self) -> None:
+        checkout = next(
+            step for step in self.steps if "checkout" in step.get("uses", "")
+        )
+        self.assertEqual(
+            checkout["with"]["ref"], "feat/standalone-weekly-gain"
+        )
+        self.assertEqual(checkout["with"]["persist-credentials"], "false")
 
     def test_same_account_is_serialized_without_cancelling_running_job(
         self,
@@ -826,32 +874,180 @@ class GainWorkflowTests(unittest.TestCase):
     def test_secrets_are_only_in_runtime_step_and_only_safe_logs_uploaded(
         self,
     ) -> None:
-        steps = self.workflow["jobs"]["gain"]["steps"]
-        runtime = next(
-            step
-            for step in steps
-            if "GAIN_REFRESH_TOKEN" in step.get("env", {})
-        )
         self.assertEqual(
-            runtime["env"]["GAIN_REFRESH_TOKEN"],
+            self.runtime["env"]["GAIN_REFRESH_TOKEN"],
             "${{ secrets.GAIN_REFRESH_TOKEN }}",
         )
         self.assertEqual(
-            runtime["env"]["GAIN_DEVICE_ID"], "${{ secrets.GAIN_DEVICE_ID }}"
+            self.runtime["env"]["GAIN_DEVICE_ID"],
+            "${{ secrets.GAIN_DEVICE_ID }}",
         )
-        self.assertIn("--gain-query", runtime["run"])
-        self.assertIn("--gain-only", runtime["run"])
-        self.assertNotIn("secrets.", runtime["run"])
+        self.assertNotIn("secrets.", self.runtime["run"])
         self.assertNotIn("WEREAD_CURL", str(self.workflow))
-        self.assertNotIn("continue-on-error", runtime)
-        for step in steps:
-            if step is not runtime:
+        self.assertNotIn("continue-on-error", self.runtime)
+        for step in self.steps:
+            if step is not self.runtime:
                 self.assertNotIn("GAIN_REFRESH_TOKEN", step.get("env", {}))
+                self.assertNotIn("GAIN_DEVICE_ID", step.get("env", {}))
         artifact = next(
-            step for step in steps if "upload-artifact" in step.get("uses", "")
+            step
+            for step in self.steps
+            if "upload-artifact" in step.get("uses", "")
         )
         self.assertEqual(artifact["if"], "always()")
         self.assertEqual(artifact["with"]["path"], "logs/weekly-gain.log")
+
+    def test_notification_reuses_secrets_and_does_not_change_claim_outcome(
+        self,
+    ) -> None:
+        self.assertEqual(self.notification["if"], "always()")
+        self.assertEqual(self.notification["continue-on-error"], "true")
+        self.assertEqual(self.notification["timeout-minutes"], "2")
+        self.assertEqual(
+            self.notification["env"],
+            {
+                "APPRISE_URL": "${{ secrets.APPRISE_URL }}",
+                "NOTIFICATION_ONLY_ON_FAILURE": (
+                    "${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}"
+                ),
+                "GAIN_OUTCOME": "${{ steps.claim.outcome }}",
+            },
+        )
+        self.assertNotIn("secrets.", self.notification["run"])
+        self.assertLess(
+            self.steps.index(self.runtime), self.steps.index(self.notification)
+        )
+
+    def run_notification(
+        self,
+        outcome: str = "success",
+        only_failure: str = "false",
+        url: str = "test://notification-placeholder",
+        cli_exit: int = 0,
+    ) -> Tuple[subprocess.CompletedProcess, Optional[dict]]:
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "capture.json"
+            cli = Path(directory) / "apprise"
+            # 假 CLI 只记录调用，并故意输出 URL 来验证 workflow 的脱敏。
+            cli.write_text(
+                f"#!{sys.executable}\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['APPRISE_CAPTURE']).write_text(json.dumps({\n"
+                "    'argv': sys.argv[1:],\n"
+                "    'urls': os.environ.get('APPRISE_URLS'),\n"
+                "}), encoding='utf-8')\n"
+                "sys.stdout.write(os.environ['APPRISE_URLS'])\n"
+                "sys.stderr.write(os.environ['APPRISE_URLS'])\n"
+                "sys.exit(int(os.environ['APPRISE_EXIT']))\n",
+                encoding="utf-8",
+            )
+            cli.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    self.notification["run"],
+                ],
+                env={
+                    "PATH": f"{directory}:{os.defpath}",
+                    "APPRISE_CAPTURE": str(capture),
+                    "APPRISE_EXIT": str(cli_exit),
+                    "APPRISE_URL": url,
+                    "NOTIFICATION_ONLY_ON_FAILURE": only_failure,
+                    "GAIN_OUTCOME": outcome,
+                    "GITHUB_REPOSITORY": "test-owner/test-repo",
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_RUN_ID": "123",
+                    "GAIN_REFRESH_TOKEN": "fake-refresh-for-redaction-test",
+                    "GAIN_DEVICE_ID": "fake-device-for-redaction-test",
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            call = (
+                json.loads(capture.read_text(encoding="utf-8"))
+                if capture.exists()
+                else None
+            )
+            self.assertNotIn("notification-placeholder", result.stdout)
+            self.assertNotIn("notification-placeholder", result.stderr)
+            return result, call
+
+    def test_notification_without_url_skips_cli(self) -> None:
+        result, call = self.run_notification(url="")
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(call)
+        self.assertEqual(result.stdout, "")
+
+    def test_success_notification_uses_env_url_and_safe_run_link(self) -> None:
+        result, call = self.run_notification()
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNotNone(call)
+        self.assertEqual(call["urls"], "test://notification-placeholder")
+        self.assertEqual(
+            call["argv"][:3],
+            [
+                "--title",
+                "微信读书每周领奖报告",
+                "--body",
+            ],
+        )
+        self.assertEqual(len(call["argv"]), 4)
+        self.assertIn("领奖任务成功", call["argv"][3])
+        self.assertIn(
+            "https://github.com/test-owner/test-repo/actions/runs/123",
+            call["argv"][3],
+        )
+        self.assertNotIn("notification-placeholder", str(call["argv"]))
+        self.assertNotIn("fake-refresh", str(call["argv"]))
+        self.assertNotIn("fake-device", str(call["argv"]))
+        self.assertIn("Apprise 通知已发送", result.stdout)
+
+    def test_only_failure_skips_success_notification(self) -> None:
+        for value in ("true", "True", "TRUE", "1", "yes", "YES", "on", "On"):
+            with self.subTest(value=value):
+                result, call = self.run_notification(only_failure=value)
+                self.assertEqual(result.returncode, 0)
+                self.assertIsNone(call)
+
+    def test_failure_notifies_even_when_only_failure_is_enabled(self) -> None:
+        result, call = self.run_notification(
+            outcome="failure", only_failure="true"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("失败、部分失败或待确认", call["argv"][3])
+
+    def test_cancelled_and_skipped_steps_do_not_report_success(self) -> None:
+        for outcome, message in (
+            ("cancelled", "领奖任务已中断"),
+            ("skipped", "领奖步骤未执行"),
+        ):
+            with self.subTest(outcome=outcome):
+                result, call = self.run_notification(
+                    outcome=outcome, only_failure="true"
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertIn(message, call["argv"][3])
+                self.assertNotIn("领奖任务成功", call["argv"][3])
+
+    def test_notification_failure_hides_raw_cli_output(self) -> None:
+        result, call = self.run_notification(cli_exit=1)
+        self.assertIsNotNone(call)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Apprise 通知失败", result.stdout)
+        self.assertEqual(self.notification["continue-on-error"], "true")
+        self.assertNotIn("continue-on-error", self.runtime)
 
 
 if __name__ == "__main__":

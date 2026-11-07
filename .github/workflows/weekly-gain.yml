@@ -1,30 +1,10 @@
 name: Weekly Rewards
 
 on:
-  workflow_dispatch:
-    inputs:
-      enable_once:
-        description: '显式开启本次运行（未设置仓库 GAIN_ENABLED=true 时须勾选）'
-        type: boolean
-        default: false
-      operation:
-        description: '操作：query 只查询；claim 领取并回查'
-        type: choice
-        options:
-          - query
-          - claim
-        default: query
-      reward_type:
-        description: '奖励类型：default 使用仓库 Variable GAIN_TYPE，未设置则书币'
-        type: choice
-        options:
-          - default
-          - '2'
-          - '1'
-        default: default
-  # 合并到默认分支并完成查询/领取验证后，再取消注释启用每日领取。
-  # schedule:
-  #   - cron: '17 1 * * *'  # UTC 01:17 = 北京时间 09:17
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 19 * * 6'  # UTC 周六 19:00 = 北京时间周日 03:00
+    - cron: '0 4 * * 0'   # UTC 周日 04:00 = 北京时间周日 12:00
 
 permissions:
   contents: read
@@ -36,7 +16,7 @@ concurrency:
 
 jobs:
   gain:
-    if: ${{ vars.GAIN_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.enable_once == true) }}
+    if: ${{ vars.GAIN_ENABLED != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -44,6 +24,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # main 仅保存调度定义，运行开发分支最新推送的业务版本。
+          ref: feat/standalone-weekly-gain
           persist-credentials: false
 
       - name: Set up Python
@@ -55,28 +37,54 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Query or claim weekly rewards
+      - name: Claim weekly rewards
+        id: claim
         env:
-          GAIN_ENABLED: ${{ vars.GAIN_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.enable_once == true) }}
-          GAIN_TYPE: ${{ (inputs.reward_type != 'default' && inputs.reward_type) || vars.GAIN_TYPE || '2' }}
+          GAIN_ENABLED: ${{ vars.GAIN_ENABLED || 'true' }}
+          GAIN_TYPE: ${{ vars.GAIN_TYPE || '2' }}
           GAIN_REFRESH_TOKEN: ${{ secrets.GAIN_REFRESH_TOKEN }}
           GAIN_DEVICE_ID: ${{ secrets.GAIN_DEVICE_ID }}
-          GAIN_OPERATION: ${{ inputs.operation || 'claim' }}
           LOG_FILE: logs/weekly-gain.log
           LOG_FORMAT: json
           LOG_LEVEL: INFO
+        run: python weread-bot.py --config "$RUNNER_TEMP/weread-gain.yaml" --gain-only
+
+      - name: Send Apprise notification
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          APPRISE_URL: ${{ secrets.APPRISE_URL }}
+          NOTIFICATION_ONLY_ON_FAILURE: ${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}
+          GAIN_OUTCOME: ${{ steps.claim.outcome }}
         run: |
-          case "$GAIN_OPERATION" in
-            query)
-              python weread-bot.py --config "$RUNNER_TEMP/weread-gain.yaml" --gain-query
-              ;;
-            claim)
-              python weread-bot.py --config "$RUNNER_TEMP/weread-gain.yaml" --gain-only
-              ;;
-            *)
-              exit 1
+          if [ -z "$APPRISE_URL" ]; then
+            exit 0
+          fi
+          case "$NOTIFICATION_ONLY_ON_FAILURE" in
+            [tT][rR][uU][eE]|1|[yY][eE][sS]|[oO][nN])
+              if [ "$GAIN_OUTCOME" = "success" ]; then
+                exit 0
+              fi
               ;;
           esac
+          case "$GAIN_OUTCOME" in
+            success) result='领奖任务成功：档位已确认或没有可领取奖励。' ;;
+            failure) result='领奖任务失败、部分失败或待确认，请查看脱敏日志。' ;;
+            cancelled) result='领奖任务已中断，请在 App 核实在途请求。' ;;
+            *) result='领奖步骤未执行，请检查 workflow 的前置步骤。' ;;
+          esac
+          printf -v body '%s\n仓库：%s\n运行记录：%s/%s/actions/runs/%s' \
+            "$result" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          # Apprise CLI 从环境变量读取 URL，不写文件或将 URL 放到命令参数。
+          export APPRISE_URLS="$APPRISE_URL"
+          if apprise --title '微信读书每周领奖报告' --body "$body" >/dev/null 2>&1; then
+            printf '%s\n' 'Apprise 通知已发送'
+          else
+            printf '%s\n' 'Apprise 通知失败（通知 URL 和原始错误已隐藏）'
+            exit 1
+          fi
 
       - name: Upload redacted reward log
         if: always()
