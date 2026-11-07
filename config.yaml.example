@@ -11,7 +11,15 @@ app:
   # 多用户时最大并发数；1=顺序执行，2+=同时执行多用户（示例：1、2、3）
   max_concurrent_users: 1
 
-# CURL 配置（支持单用户和多用户模式）
+# 独立应用端每周领奖：只有 --gain-query / --gain-only 读取此段，普通阅读不会领奖。
+# 凭据来自手机/墨水屏应用端 /login 抓包，与网页 CURL 无关；勿提交个人凭据。
+gain:
+  enabled: false             # 必须显式开启；提供凭据不会自动开启。环境变量：GAIN_ENABLED
+  gain_type: 2               # 2=书币（默认），1=卡类；不支持所选奖励时不回退。GAIN_TYPE
+  refresh_token: ""          # 建议通过 GAIN_REFRESH_TOKEN 环境变量提供
+  device_id: ""              # 与 RefreshToken 配对，通过 GAIN_DEVICE_ID 提供
+
+# 以下 CURL 配置只用于网页阅读（支持单用户和多用户模式），独立领奖不读取。
 curl_config:
   # 单用户模式：从文件读取 CURL bash 命令。多用户模式下此项无效；若同时配置单用户与多用户，优先多用户。
   file_path: "curl_command.txt"   # 示例：curl_command.txt、./cookies/me.txt（浏览器复制为 cURL 后保存）

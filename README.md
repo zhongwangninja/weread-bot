@@ -169,8 +169,14 @@ python weread-bot.py --validate-config --config config.yaml
 # 输出运行诊断信息，不发起阅读请求
 python weread-bot.py --dry-run --config config.yaml
 
-# 查看最近一次真实执行结果
+# 查看最近一次真实阅读执行结果
 python weread-bot.py --show-last-run --config config.yaml
+
+# 独立查询应用端奖励（需显式启用 gain，会联网但不领取）
+python weread-bot.py --gain-query --config config.yaml
+
+# 独立领取并回查（不加载网页 CURL）
+python weread-bot.py --gain-only --config config.yaml
 
 # 查看所有可用命令
 python weread-bot.py --help
@@ -181,7 +187,7 @@ python weread-bot.py --help
 - `--validate-config` 会输出用户数量、用户级 `CURL` 来源、时间策略覆盖情况和全局/用户配置差异摘要。
 - `--dry-run` 会在 `--validate-config` 的基础上继续输出通知触发配置、通道就绪状态、缺失字段和禁用通道摘要，但不会真正发起阅读请求。
 - `--show-last-run` 只读取 `history.file` 指向的本地历史文件，输出最近一次真实执行摘要后退出，不会初始化阅读会话。
-- 真实执行结束后，如 `history.enabled=true`，程序会把最近执行摘要写入默认文件 `logs/run-history.json`。
+- 真实阅读执行结束后，如 `history.enabled=true`，程序会把最近阅读摘要写入默认文件 `logs/run-history.json`；独立领奖只记录日志。
 - 历史记录只保存时间、状态、用户数、阅读统计和失败分类等摘要，不会保存 Cookie、请求头或原始 CURL。
 - 如果 `curl_config.users[].reading_overrides` 中存在不支持的键，程序会直接提示对应配置路径。
 - 如果 `curl_config.users[].cookie_refresh_ql` 不是布尔值，程序会直接提示对应配置路径。
@@ -238,7 +244,7 @@ open config-generator.html
 
 ### 必需配置
 
-如果 **未使用配置文件配置**，必须通过环境变量参数提供以下配置：
+网页阅读如果 **未使用配置文件配置**，必须通过环境变量提供以下配置；独立领奖不需要 CURL，见[独立每周奖励领取](#独立每周奖励领取默认关闭)：
 
 | 配置项 | 环境变量 | 说明 |
 |--------|----------|------|
@@ -248,6 +254,51 @@ open config-generator.html
 - `WEREAD_CURL_BASH_FILE_PATH`：此环境变量适合在本地或Docker中使用，内容为保存CURL命令的文件路径
 
 > 获取CURL命令详见[抓包配置详解](#抓包配置详解)
+
+### 独立每周奖励领取（默认关闭）
+
+领奖与网页阅读完全独立，仅支持一份应用端账号凭据，不需要 CURL、书籍或阅读配置。普通阅读命令不会自动领奖，即使已配置 `gain.enabled: true`。
+
+```yaml
+gain:
+  enabled: false
+  gain_type: 2
+  refresh_token: ""
+  device_id: ""
+```
+
+| YAML 配置 | 环境变量 | 默认值 | 说明 |
+|-----------|----------|--------|------|
+| `gain.enabled` | `GAIN_ENABLED` | `false` | 必须显式开启，提供凭据或选择 CLI 模式不会自动开启 |
+| `gain.gain_type` | `GAIN_TYPE` | `2` | `2`=书币，`1`=卡类奖励（以服务端描述为准） |
+| `gain.refresh_token` | `GAIN_REFRESH_TOKEN` | 空 | 应用端 RefreshToken |
+| `gain.device_id` | `GAIN_DEVICE_ID` | 空 | 与 RefreshToken 配对的 DeviceId |
+
+凭据需从自己的手机/墨水屏微信读书应用端 `https://i.weread.qq.com/login` 请求体获取，不能用网页 Cookie 替代。只保存到本地配置或环境变量，不提交到仓库，不分享完整登录响应。当前使用墨水屏版 1.9.3 的客户端请求格式；未经你的账号与网络环境实测，不保证兼容或长期有效。
+
+显式开启并配置凭据后，先查询，再决定是否领取：
+
+```bash
+# 联网登录并查询奖励，不领取；不是离线诊断
+python weread-bot.py --config config.yaml --gain-query
+
+# 查询、领取所有可领取且支持所选奖励的档位，再回查状态
+python weread-bot.py --config config.yaml --gain-only
+```
+
+- 两个入口互斥，不能与 `--mode`、`--dry-run`、`--validate-config`、`--show-last-run` 混用。关闭时零应用端请求并退出 `1`。
+- 支持环境变量独立运行；领奖只读取 `gain`、`network`、`logging`，不展开闲置阅读配置的占位符。普通阅读不解析 `gain`。配置文件整体仍必须是合法 YAML；配置生成器目前只生成阅读配置。
+- 默认只领书币；该档不支持书币、选项结构未知或状态未知时跳过，不改领卡类。不把 HTTP 200 或缺少 `errcode` 当作领取成功。
+- 所有应用端请求只尝试一次，忽略共享 `network.retry_times` 的重试次数，但不改变网页阅读的重试配置。领取后回查档位；网络超时或无法对应档位/周周期时显示“待确认”，不重发领取，请在 App 检查。
+- 在限速等待后再次检查取消和周期；临近北京时间周边界时预留四倍网络超时的窗口，不发起新的领取（默认最后两分钟）。收到中断信号会取消等待/在途任务，但不能撤销服务端已处理的请求。
+- 回查确认的是档位已领取，不等于独立验证书币余额增加。首次真实领取建议仅有一个可领取档位时试跑，并在 App 人工核实。
+- 成功查询、无可领取档位或所有领取已确认退出 `0`；失败、部分失败、不支持所选奖励或待确认退出 `1`；中断退出 `130`。
+- 第一版只输出脱敏日志，不发送通知、不写阅读历史，`--show-last-run` 不显示领奖结果；不修改、派生或续期网页 Cookie。
+- RefreshToken 若发生轮换，仅保留在当前进程；下一次登录失败时须重新获取并更新本地配置/Secrets，不自动写回凭据。
+
+Actions 使用独立的 `Weekly Rewards` workflow，默认关闭且手动默认只查询，详见 [独立领奖 Actions 配置](docs/github-action-autoread-guide.md#独立每周领奖-actions)。青龙请创建单独任务，见 [独立每周领奖任务](docs/qinglong-guide.md#独立每周领奖任务)。
+
+协议参考：[tophtab 的领奖实现](https://github.com/tophtab/weread-bot/commit/2654110fc53784c265e987427dc8ac1ca666998b)。奖励选项 `choiceType` / `canChoice` / `awardNum` 结构参考 [scripts-hub](https://github.com/Zzz210s/scripts-hub/blob/8dcd99c602cd1a5b44cdd147799d81761e8a9d70/proj-weread-signin/src/weekly.js) 和 [WeRead-Kit](https://github.com/27Aaron/WeRead-Kit/blob/faf169d8ce573d9a6a2700f207549c775289b340/internal/weread/weekly.go)；不依赖这些项目的运行时服务。
 
 ### 多用户配置
 

@@ -1,0 +1,88 @@
+name: Weekly Rewards
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_once:
+        description: '显式开启本次运行（未设置仓库 GAIN_ENABLED=true 时须勾选）'
+        type: boolean
+        default: false
+      operation:
+        description: '操作：query 只查询；claim 领取并回查'
+        type: choice
+        options:
+          - query
+          - claim
+        default: query
+      reward_type:
+        description: '奖励类型：default 使用仓库 Variable GAIN_TYPE，未设置则书币'
+        type: choice
+        options:
+          - default
+          - '2'
+          - '1'
+        default: default
+  # 合并到默认分支并完成查询/领取验证后，再取消注释启用每日领取。
+  # schedule:
+  #   - cron: '17 1 * * *'  # UTC 01:17 = 北京时间 09:17
+
+permissions:
+  contents: read
+
+# 同一账号跨分支共用并发组；不取消可能已有在途领取请求的运行。
+concurrency:
+  group: weread-weekly-gain
+  cancel-in-progress: false
+
+jobs:
+  gain:
+    if: ${{ vars.GAIN_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.enable_once == true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Query or claim weekly rewards
+        env:
+          GAIN_ENABLED: ${{ vars.GAIN_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.enable_once == true) }}
+          GAIN_TYPE: ${{ (inputs.reward_type != 'default' && inputs.reward_type) || vars.GAIN_TYPE || '2' }}
+          GAIN_REFRESH_TOKEN: ${{ secrets.GAIN_REFRESH_TOKEN }}
+          GAIN_DEVICE_ID: ${{ secrets.GAIN_DEVICE_ID }}
+          GAIN_OPERATION: ${{ inputs.operation || 'claim' }}
+          LOG_FILE: logs/weekly-gain.log
+          LOG_FORMAT: json
+          LOG_LEVEL: INFO
+        run: |
+          case "$GAIN_OPERATION" in
+            query)
+              python weread-bot.py --config "$RUNNER_TEMP/weread-gain.yaml" --gain-query
+              ;;
+            claim)
+              python weread-bot.py --config "$RUNNER_TEMP/weread-gain.yaml" --gain-only
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+
+      - name: Upload redacted reward log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-gain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/weekly-gain.log
+          if-no-files-found: ignore
+          retention-days: 7

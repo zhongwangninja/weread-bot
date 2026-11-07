@@ -58,7 +58,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Set, Union, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 
@@ -156,6 +156,8 @@ def log_context(user: str, session_id: Optional[str] = None):
 SENSITIVE_LOG_KEYS = {
     "authorization", "cookie", "cookies", "wr_skey", "token", "bot_token",
     "webhook_url", "secret", "ps", "pc", "sendkey", "pushkey", "device_key",
+    "refreshtoken", "refresh_token", "accesstoken", "access_token",
+    "deviceid", "device_id", "vid",
 }
 SENSITIVE_LOG_KEY_PATTERN = "|".join(
     sorted((re.escape(key) for key in SENSITIVE_LOG_KEYS), key=len, reverse=True)
@@ -466,6 +468,15 @@ class HackConfig:
 
 
 @dataclass
+class GainConfig:
+    """独立应用端每周领奖配置，默认关闭。"""
+    enabled: bool = False
+    gain_type: int = 2
+    refresh_token: str = field(default="", repr=False)
+    device_id: str = field(default="", repr=False)
+
+
+@dataclass
 class WeReadConfig:
     """微信读书配置主类"""
     # App 基本配置
@@ -496,6 +507,7 @@ class WeReadConfig:
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
+    gain: GainConfig = field(default_factory=GainConfig)
 
     def get_startup_info(self) -> str:
         """获取启动信息摘要"""
@@ -762,7 +774,9 @@ class ConfigError(ValueError):
 
 def _config_error(path: str, reason: str, value: Any) -> ConfigError:
     safe_value = repr(value)
-    if any(key in path.lower() for key in ("token", "cookie", "secret", "content")):
+    if any(key in path.lower() for key in (
+        "token", "cookie", "secret", "content", "device_id", "deviceid"
+    )):
         safe_value = "已提供" if value else "未提供"
     return ConfigError(f"{path}: {reason}，当前值={safe_value}")
 
@@ -854,6 +868,41 @@ def parse_choice(value: Any, path: str, choices: Set[str]) -> str:
     return normalized
 
 
+def validate_network_logging_config(config: WeReadConfig) -> None:
+    """校验阅读与领奖共用的网络和日志配置。"""
+    parse_int(config.network.timeout, "network.timeout", 1)
+    parse_int(config.network.retry_times, "network.retry_times", 1)
+    parse_range(config.network.retry_delay, "network.retry_delay", 0)
+    parse_int(config.network.rate_limit, "network.rate_limit", 0)
+    config.logging.level = parse_choice(
+        config.logging.level,
+        "logging.level",
+        {"debug", "info", "warning", "error", "critical"},
+    ).upper()
+    config.logging.format = parse_choice(
+        config.logging.format,
+        "logging.format",
+        {"simple", "detailed", "json"},
+    )
+    parse_int(config.logging.backup_count, "logging.backup_count", 0)
+
+
+def validate_gain_config(config: GainConfig) -> None:
+    """启用领奖时才要求合法奖励类型和应用端凭据。"""
+    config.enabled = parse_bool(config.enabled, "gain.enabled")
+    if not config.enabled:
+        return
+    config.gain_type = parse_int(config.gain_type, "gain.gain_type")
+    if config.gain_type not in {1, 2}:
+        raise _config_error(
+            "gain.gain_type", "必须是 1 或 2", config.gain_type
+        )
+    for name in ("refresh_token", "device_id"):
+        value = getattr(config, name)
+        if not isinstance(value, str) or not value.strip():
+            raise _config_error(f"gain.{name}", "必须是非空字符串", value)
+
+
 def validate_config_semantics(config: WeReadConfig) -> None:
     """集中校验加载后的全局配置和用户覆盖。"""
     config.startup_mode = parse_choice(
@@ -902,10 +951,7 @@ def validate_config_semantics(config: WeReadConfig) -> None:
         "reading.smart_random.book_switch_cooldown",
         0,
     )
-    parse_int(config.network.timeout, "network.timeout", 1)
-    parse_int(config.network.retry_times, "network.retry_times", 1)
-    parse_range(config.network.retry_delay, "network.retry_delay", 0)
-    parse_int(config.network.rate_limit, "network.rate_limit", 0)
+    validate_network_logging_config(config)
     parse_float(
         config.human_simulation.break_probability,
         "human_simulation.break_probability",
@@ -919,17 +965,6 @@ def validate_config_semantics(config: WeReadConfig) -> None:
     )
     parse_range(config.daemon.session_interval, "daemon.session_interval", 0)
     parse_int(config.daemon.max_daily_sessions, "daemon.max_daily_sessions", 1)
-    config.logging.level = parse_choice(
-        config.logging.level,
-        "logging.level",
-        {"debug", "info", "warning", "error", "critical"},
-    ).upper()
-    config.logging.format = parse_choice(
-        config.logging.format,
-        "logging.format",
-        {"simple", "detailed", "json"},
-    )
-    parse_int(config.logging.backup_count, "logging.backup_count", 0)
     parse_int(config.history.max_entries, "history.max_entries", 1)
 
     for index, user in enumerate(config.users):
@@ -964,9 +999,43 @@ def validate_config_semantics(config: WeReadConfig) -> None:
 class ConfigManager:
     """配置管理器"""
 
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(
+        self, config_path: str = "config.yaml", load_scope: str = "reading"
+    ) -> None:
         self.config_path = config_path
+        self.load_scope = parse_choice(
+            load_scope, "config.load_scope", {"reading", "gain"}
+        )
         self.config = self._load_config()
+
+    def _select_config_scope(self, config_data: dict) -> dict:
+        """在展开占位符前排除未使用的任务配置。"""
+        if self.load_scope == "reading":
+            return {key: value for key, value in config_data.items()
+                    if key != "gain"}
+        selected = {key: value for key, value in config_data.items()
+                    if key in {"network", "logging", "gain"}}
+        gain_data = selected.get("gain", {})
+        if not isinstance(gain_data, dict):
+            raise ConfigError("gain: 必须是对象映射")
+        enabled = self._get_bool_config(
+            selected, "gain.enabled", "GAIN_ENABLED", False
+        )
+        active_gain = {"enabled": enabled}
+        if enabled:
+            for key, env_key in (
+                ("gain_type", "GAIN_TYPE"),
+                ("refresh_token", "GAIN_REFRESH_TOKEN"),
+                ("device_id", "GAIN_DEVICE_ID"),
+            ):
+                override = self._get_env_override(env_key)
+                value = (
+                    override if override is not None else gain_data.get(key)
+                )
+                if value is not None:
+                    active_gain[key] = value
+        selected["gain"] = active_gain
+        return selected
 
     def _load_config(self) -> WeReadConfig:
         """加载配置文件"""
@@ -981,7 +1050,9 @@ class ConfigManager:
                     config_data = yaml.safe_load(f) or {}
                 if not isinstance(config_data, dict):
                     raise _config_error("config", "根节点必须是对象映射", config_data)
-                config_data = self._resolve_config_tree(config_data)
+                config_data = self._resolve_config_tree(
+                    self._select_config_scope(config_data)
+                )
                 logging.info(f"✅ 已加载配置文件: {self.config_path}")
             except ConfigError:
                 raise
@@ -1004,6 +1075,16 @@ class ConfigManager:
                     "config: 配置文件读取或 YAML 解析失败，"
                     f"错误类型={type(e).__name__}"
                 ) from e
+
+        if self.load_scope == "gain":
+            config = WeReadConfig(
+                gain=self._load_gain_config(config_data),
+                network=self._load_network_config(config_data),
+                logging=self._load_logging_config(config_data),
+            )
+            validate_network_logging_config(config)
+            validate_gain_config(config.gain)
+            return config
 
         # 从环境变量获取配置（优先级最高）
         config = WeReadConfig(
@@ -1070,20 +1151,7 @@ class ConfigManager:
         )
 
         # 加载网络配置
-        config.network = NetworkConfig(
-            timeout=parse_int(self._get_config_value(
-                config_data, "network.timeout", "NETWORK_TIMEOUT", "30"
-            ), "network.timeout", 1),
-            retry_times=parse_int(self._get_config_value(
-                config_data, "network.retry_times", "RETRY_TIMES", "3"
-            ), "network.retry_times", 1),
-            retry_delay=self._get_config_value(
-                config_data, "network.retry_delay", "RETRY_DELAY", "5-15"
-            ),
-            rate_limit=parse_int(self._get_config_value(
-                config_data, "network.rate_limit", "RATE_LIMIT", "10"
-            ), "network.rate_limit", 0),
-        )
+        config.network = self._load_network_config(config_data)
 
         # 加载人类行为模拟配置
         config.human_simulation = HumanSimulationConfig(
@@ -1172,26 +1240,7 @@ class ConfigManager:
         )
 
         # 加载日志配置
-        config.logging = LoggingConfig(
-            level=self._get_config_value(
-                config_data, "logging.level", "LOG_LEVEL", "INFO"
-            ),
-            format=self._get_config_value(
-                config_data, "logging.format", "LOG_FORMAT", "detailed"
-            ),
-            file=self._get_config_value(
-                config_data, "logging.file", "LOG_FILE", "logs/weread.log"
-            ),
-            max_size=self._get_config_value(
-                config_data, "logging.max_size", "LOG_MAX_SIZE", "10MB"
-            ),
-            backup_count=parse_int(self._get_config_value(
-                config_data, "logging.backup_count", "LOG_BACKUP_COUNT", "5"
-            ), "logging.backup_count", 0),
-            console=self._get_bool_config(
-                config_data, "logging.console", "LOG_CONSOLE", True
-            ),
-        )
+        config.logging = self._load_logging_config(config_data)
 
         config.history = HistoryConfig(
             enabled=self._get_bool_config(
@@ -1215,6 +1264,64 @@ class ConfigManager:
 
         validate_config_semantics(config)
         return config
+
+    def _load_gain_config(self, config_data: dict) -> GainConfig:
+        enabled = self._get_bool_config(
+            config_data, "gain.enabled", "GAIN_ENABLED", False
+        )
+        if not enabled:
+            return GainConfig()
+        defaults = GainConfig()
+        return GainConfig(
+            enabled=True,
+            gain_type=parse_int(self._get_config_value(
+                config_data, "gain.gain_type", "GAIN_TYPE", defaults.gain_type
+            ), "gain.gain_type"),
+            refresh_token=self._get_config_value(
+                config_data, "gain.refresh_token", "GAIN_REFRESH_TOKEN", ""
+            ),
+            device_id=self._get_config_value(
+                config_data, "gain.device_id", "GAIN_DEVICE_ID", ""
+            ),
+        )
+
+    def _load_network_config(self, config_data: dict) -> NetworkConfig:
+        return NetworkConfig(
+            timeout=parse_int(self._get_config_value(
+                config_data, "network.timeout", "NETWORK_TIMEOUT", "30"
+            ), "network.timeout", 1),
+            retry_times=parse_int(self._get_config_value(
+                config_data, "network.retry_times", "RETRY_TIMES", "3"
+            ), "network.retry_times", 1),
+            retry_delay=self._get_config_value(
+                config_data, "network.retry_delay", "RETRY_DELAY", "5-15"
+            ),
+            rate_limit=parse_int(self._get_config_value(
+                config_data, "network.rate_limit", "RATE_LIMIT", "10"
+            ), "network.rate_limit", 0),
+        )
+
+    def _load_logging_config(self, config_data: dict) -> LoggingConfig:
+        return LoggingConfig(
+            level=self._get_config_value(
+                config_data, "logging.level", "LOG_LEVEL", "INFO"
+            ),
+            format=self._get_config_value(
+                config_data, "logging.format", "LOG_FORMAT", "detailed"
+            ),
+            file=self._get_config_value(
+                config_data, "logging.file", "LOG_FILE", "logs/weread.log"
+            ),
+            max_size=self._get_config_value(
+                config_data, "logging.max_size", "LOG_MAX_SIZE", "10MB"
+            ),
+            backup_count=parse_int(self._get_config_value(
+                config_data, "logging.backup_count", "LOG_BACKUP_COUNT", "5"
+            ), "logging.backup_count", 0),
+            console=self._get_bool_config(
+                config_data, "logging.console", "LOG_CONSOLE", True
+            ),
+        )
 
     def _load_books(self, config_data: dict) -> List[BookInfo]:
         """加载书籍配置"""
@@ -1928,16 +2035,18 @@ class HttpClient:
 
     async def post_raw(
         self, url: str, headers: dict = None, cookies: dict = None,
-        json_data: dict = None, data: Any = None
+        json_data: dict = None, data: Any = None,
+        before_send: Optional[Callable[[], None]] = None,
     ) -> Tuple[httpx.Response, float]:
         return await self._request_with_retries(
             url, headers=headers, cookies=cookies,
-            json_data=json_data, data=data
+            json_data=json_data, data=data, before_send=before_send,
         )
 
     async def _request_with_retries(
         self, url: str, headers: dict = None, cookies: dict = None,
-        json_data: dict = None, data: Any = None
+        json_data: dict = None, data: Any = None,
+        before_send: Optional[Callable[[], None]] = None,
     ) -> Tuple[httpx.Response, float]:
         attempts = max(1, self.config.retry_times)
         last_error = None
@@ -1946,6 +2055,8 @@ class HttpClient:
             start_time = time.monotonic()
             try:
                 await self._rate_limiter.acquire()
+                if before_send is not None:
+                    before_send()
                 response = await self._client.post(
                     url,
                     headers=headers,
@@ -1986,6 +2097,421 @@ class HttpClient:
                     await interruptible_sleep(delay, lambda: False)
 
         raise last_error if last_error else RuntimeError("请求失败")
+
+GAIN_LOGIN_URL = "https://i.weread.qq.com/login"
+GAIN_EXCHANGE_URL = "https://i.weread.qq.com/weekly/exchange"
+GAIN_PF = "wechat_wx-2001-android-100-weread"
+GAIN_DEVICE_HEADERS = {
+    "User-Agent": (
+        "WeRead/1.9.3 WRBrand/null wr_eink Dalvik/2.1.0 "
+        "(Linux; U; Android 14)"
+    ),
+    "baseapi": "34",
+    "appver": "1.9.3.10244349",
+    "osver": "14",
+    "channelid": "990",
+    "basever": "1.9.3.10244349",
+}
+GAIN_AWARD_GROUPS = ("readtimeAwards", "readdayAwards", "readgoalAwards")
+
+
+class GainError(RuntimeError):
+    """只携带安全操作信息和数值业务码，不保留原始响应。"""
+
+    def __init__(
+        self, message: str, kind: str = "response",
+        errcode: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.errcode = errcode
+
+    @property
+    def stops_run(self) -> bool:
+        return self.kind in {"auth", "rate_limit"}
+
+
+def _gain_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value):
+        return int(value)
+    raise GainError("应用端响应中的整数字段不兼容")
+
+
+@dataclass
+class GainAward:
+    group: str
+    level_id: int
+    status: int
+    choices: Dict[int, int] = field(default_factory=dict)
+    choices_known: bool = False
+    selected_type: Optional[int] = None
+
+
+@dataclass
+class GainResult:
+    status: str = "failed"
+    awards: List[GainAward] = field(default_factory=list)
+    confirmed: List[int] = field(default_factory=list)
+    already_claimed: List[int] = field(default_factory=list)
+    failed: List[int] = field(default_factory=list)
+    skipped: List[int] = field(default_factory=list)
+    unknown: List[int] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        if self.status == "cancelled":
+            return 130
+        return 0 if self.status == "success" else 1
+
+
+class GainManager:
+    """单账号、一次性应用端领奖，不接触网页会话或 Cookie。"""
+
+    def __init__(
+        self, config: WeReadConfig, http_client: Any = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        self.config = config
+        self.http_client = http_client
+        self._is_cancelled = is_cancelled or (lambda: False)
+        self._headers: Dict[str, str] = {}
+        self._refresh_token = config.gain.refresh_token
+
+    def _check_cancelled(self) -> None:
+        if self._is_cancelled():
+            raise asyncio.CancelledError()
+
+    @staticmethod
+    def _week_key() -> str:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%G-%V")
+
+    def _check_claim_window(self, week: str) -> None:
+        """在限速等待之后检查周期，并给网络阶段预留跨周余量。"""
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        next_week = (now + timedelta(days=7 - now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        if (self._week_key() != week
+                or (next_week - now).total_seconds()
+                <= max(5, self.config.network.timeout * 4)):
+            raise GainError(
+                "已跨周或临近周边界，未发送领取，请稍后重新查询", "not_sent"
+            )
+
+    @staticmethod
+    def _exchange_body(level_id: int = 0, choice_type: int = 0) -> dict:
+        return {
+            "awardLevelId": level_id,
+            "awardChoiceType": choice_type,
+            "isExchangeAward": int(level_id != 0),
+            "isVisitReadGoal": 1,
+            "unread": 1,
+            "pf": GAIN_PF,
+        }
+
+    async def _request_json(
+        self, operation: str, url: str, headers: dict, body: dict,
+        claim_week: Optional[str] = None,
+    ) -> dict:
+        def before_send() -> None:
+            self._check_cancelled()
+            if claim_week is not None:
+                self._check_claim_window(claim_week)
+
+        self._check_cancelled()
+        try:
+            response, _ = await self.http_client.post_raw(
+                url, headers=headers, json_data=body, before_send=before_send,
+            )
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+        except httpx.RequestError:
+            raise GainError(
+                f"{operation}请求结果不明，请检查网络", "unknown"
+            ) from None
+        self._check_cancelled()
+        status = response.status_code
+        if status in {401, 403, 429}:
+            kind = "rate_limit" if status == 429 else "auth"
+            raise GainError(f"{operation}失败: HTTP {status}", kind)
+        try:
+            data = response.json()
+        except (ValueError, UnicodeError):
+            raise GainError(
+                f"{operation}响应不是有效 JSON", "unknown"
+            ) from None
+        if not isinstance(data, dict) or not data:
+            raise GainError(f"{operation}响应结构不兼容", "unknown")
+        errcode = _gain_int(data.get("errcode", 0))
+        if errcode or not 200 <= status < 300:
+            message = data.get("errmsg", "")
+            message = message.lower() if isinstance(message, str) else ""
+            kind = "business" if errcode else "unknown"
+            if errcode == -2013 or any(word in message for word in (
+                "鉴权", "登录", "凭证", "token", "unauthorized", "expired"
+            )):
+                kind = "auth"
+            elif any(word in message for word in (
+                "频繁", "限流", "too many", "rate limit"
+            )):
+                kind = "rate_limit"
+            raise GainError(
+                f"{operation}失败: HTTP {status}, errcode={errcode}",
+                kind, errcode,
+            )
+        return data
+
+    async def _login(self) -> None:
+        data = await self._request_json(
+            "登录", GAIN_LOGIN_URL, GAIN_DEVICE_HEADERS,
+            {
+                "deviceId": self.config.gain.device_id,
+                "deviceName": "微信阅读器(第二代)",
+                "refreshToken": self._refresh_token,
+                "inBackground": 0,
+                "kickType": 1,
+            },
+        )
+        token = data.get("accessToken")
+        vid = _gain_int(data.get("vid"))
+        if not isinstance(token, str) or not token.strip() or vid <= 0:
+            raise GainError("登录响应缺少合法应用端凭据")
+        self._headers = {
+            **GAIN_DEVICE_HEADERS, "accesstoken": token, "vid": str(vid)
+        }
+        renewed = data.get("refreshToken")
+        if (isinstance(renewed, str) and renewed
+                and renewed != self._refresh_token):
+            self._refresh_token = renewed
+            logging.warning(
+                "应用端刷新凭据发生变化，仅保留在本次运行内；"
+                "下次登录失败时请重新获取并更新本地凭据"
+            )
+        logging.info("🎁 应用端登录成功")
+
+    @staticmethod
+    def _parse_awards(data: dict) -> List[GainAward]:
+        if any(not isinstance(data.get(key), list)
+               for key in GAIN_AWARD_GROUPS[:2]):
+            raise GainError("查询响应缺少合法阅读时长/天数奖励列表")
+        awards = []
+        seen: Set[int] = set()
+        for group in GAIN_AWARD_GROUPS:
+            items = data.get(group, [])
+            if not isinstance(items, list):
+                raise GainError("查询响应中的奖励列表不兼容")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise GainError("查询响应中的档位不兼容")
+                level_id = _gain_int(item.get("awardLevelId"))
+                status = _gain_int(item.get("awardStatus"))
+                if level_id <= 0 or level_id in seen:
+                    raise GainError("查询响应包含无效或重复档位 ID")
+                seen.add(level_id)
+                award = GainAward(group, level_id, status)
+                selected = item.get("awardChooseType")
+                if selected is not None:
+                    award.selected_type = _gain_int(selected) or None
+                choices = item.get("awardChoices")
+                if isinstance(choices, list):
+                    try:
+                        for choice in choices:
+                            if not isinstance(choice, dict):
+                                raise GainError("奖励选项结构不兼容")
+                            kind = _gain_int(choice.get("choiceType"))
+                            count = _gain_int(choice.get("awardNum"))
+                            available = _gain_int(choice.get("canChoice"))
+                            if (kind <= 0 or kind in award.choices or count < 0
+                                    or available not in {0, 1}
+                                    or (available == 1 and count == 0)):
+                                raise GainError("奖励选项字段不兼容")
+                            award.choices[kind] = count if available else 0
+                        award.choices_known = True
+                    except GainError:
+                        award.choices.clear()
+                awards.append(award)
+        return awards
+
+    async def _query(self) -> Tuple[List[GainAward], str]:
+        week = self._week_key()
+        data = await self._request_json(
+            "查询", GAIN_EXCHANGE_URL, self._headers, self._exchange_body()
+        )
+        awards = self._parse_awards(data)
+        if self._week_key() != week:
+            raise GainError("查询跨越北京时间周边界，请稍后重新查询")
+        return awards, week
+
+    async def _claim_and_verify(
+        self, award: GainAward, week: str, result: GainResult,
+    ) -> bool:
+        claim_error = None
+        try:
+            await self._request_json(
+                "领取", GAIN_EXCHANGE_URL, self._headers,
+                self._exchange_body(
+                    award.level_id, self.config.gain.gain_type
+                ),
+                claim_week=week,
+            )
+        except GainError as exc:
+            claim_error = exc
+            logging.warning("档位 %s: %s", award.level_id, exc)
+            if exc.kind == "not_sent":
+                result.skipped.append(award.level_id)
+                result.error = str(exc)
+                return False
+            if exc.stops_run:
+                result.failed.append(award.level_id)
+                result.error = str(exc)
+                return False
+        try:
+            awards, current_week = await self._query()
+            current = next((item for item in awards
+                            if item.level_id == award.level_id
+                            and item.group == award.group), None)
+            if current_week != week or current is None:
+                raise GainError("领取后的档位或周周期无法对应")
+        except GainError as exc:
+            result.unknown.append(award.level_id)
+            result.error = str(exc)
+            logging.warning("档位 %s 待确认: %s", award.level_id, exc)
+            return False
+        if current.status == 2 and current.selected_type in (
+            None, self.config.gain.gain_type
+        ):
+            if claim_error is not None and claim_error.errcode == -2664:
+                result.already_claimed.append(award.level_id)
+            else:
+                result.confirmed.append(award.level_id)
+            logging.info("🎁 档位 %s 已领取（回查确认）", award.level_id)
+        elif claim_error is not None and claim_error.kind == "business":
+            result.failed.append(award.level_id)
+        else:
+            result.unknown.append(award.level_id)
+            logging.warning(
+                "档位 %s 待确认，请在 App 检查；不会重发领取请求",
+                award.level_id,
+            )
+        return True
+
+    async def run(self, query_only: bool = False) -> GainResult:
+        result = GainResult()
+        try:
+            validate_gain_config(self.config.gain)
+            if not self.config.gain.enabled:
+                result.error = "领奖默认关闭，请显式设置 GAIN_ENABLED=true"
+                return result
+            self._check_cancelled()
+            if self.http_client is None:
+                self.http_client = HttpClient(
+                    replace(self.config.network, retry_times=1)
+                )
+            await self._login()
+            result.awards, week = await self._query()
+            for award in result.awards:
+                logging.info(
+                    "🎁 档位 %s: status=%s, 可选奖励=%s%s",
+                    award.level_id, award.status,
+                    {kind: count for kind, count in award.choices.items()
+                     if count},
+                    "" if award.choices_known else "（选项结构未知）",
+                )
+            if query_only:
+                result.status = "success"
+                return result
+            for award in result.awards:
+                self._check_cancelled()
+                if award.status == 2:
+                    result.already_claimed.append(award.level_id)
+                    continue
+                if award.status == 0:
+                    continue
+                if (award.status != 1 or not award.choices_known
+                        or not award.choices.get(self.config.gain.gain_type)):
+                    result.skipped.append(award.level_id)
+                    logging.warning(
+                        "档位 %s 不支持所选奖励或状态未知，跳过",
+                        award.level_id,
+                    )
+                    continue
+                if self._week_key() != week:
+                    result.error = "已跨越北京时间周边界，停止领取，请重新查询"
+                    break
+                if not await self._claim_and_verify(award, week, result):
+                    break
+            if not (result.error or result.failed or result.skipped
+                    or result.unknown):
+                result.status = "success"
+            elif result.confirmed:
+                result.status = "partial_success"
+        except asyncio.CancelledError:
+            result.status = "cancelled"
+            result.error = "收到中断信号，请在 App 核实在途领取请求"
+        except (GainError, ConfigError) as exc:
+            result.error = str(exc)
+        except Exception as exc:
+            result.error = (
+                f"领奖流程异常（{type(exc).__name__}），请检查配置或网络"
+            )
+        finally:
+            if self.http_client is not None:
+                try:
+                    close_task = asyncio.create_task(self.http_client.close())
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        result.status = "cancelled"
+                        result.error = "收到中断信号，请在 App 核实在途请求"
+                        await close_task
+                except Exception as exc:
+                    result.status = "failed"
+                    result.error = (
+                        f"关闭领奖客户端失败（{type(exc).__name__}）"
+                    )
+        return result
+
+
+async def run_gain(config: WeReadConfig, query_only: bool = False) -> int:
+    """独立领奖生命周期；不创建阅读应用、通知或历史记录。"""
+    cancelled = False
+    task = asyncio.current_task()
+
+    def handle_signal(signum: int, frame: Any) -> None:
+        nonlocal cancelled
+        if not cancelled:
+            cancelled = True
+            if task is not None:
+                task.cancel()
+
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, handle_signal)
+        with log_context("gain"):
+            result = await GainManager(
+                config, is_cancelled=lambda: cancelled
+            ).run(query_only=query_only)
+            logging.info(
+                "🎁 %s结果: status=%s confirmed=%s already_claimed=%s "
+                "failed=%s skipped=%s unknown=%s",
+                "查询" if query_only else "领奖", result.status,
+                result.confirmed, result.already_claimed, result.failed,
+                result.skipped, result.unknown,
+            )
+            if result.error:
+                logging.error("🎁 %s", result.error)
+            return result.exit_code
+    except asyncio.CancelledError:
+        logging.info("🎁 领奖已中断，请在 App 核实在途请求")
+        return 130
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
 
 class UserAgentRotator:
     """User-Agent轮换器"""
@@ -4835,7 +5361,21 @@ def parse_arguments(argv: Optional[List[str]] = None):
         help="显示最近一次真实执行结果并退出"
     )
 
-    return parser.parse_args(argv)
+    gain_modes = parser.add_mutually_exclusive_group()
+    gain_modes.add_argument(
+        "--gain-query", action="store_true",
+        help="独立登录应用端并查询每周奖励，不领取（需显式启用 gain）",
+    )
+    gain_modes.add_argument(
+        "--gain-only", action="store_true",
+        help="独立领取每周奖励并回查，不加载网页 CURL（需显式启用 gain）",
+    )
+    args = parser.parse_args(argv)
+    if (args.gain_query or args.gain_only) and (
+        args.mode or args.dry_run or args.validate_config or args.show_last_run
+    ):
+        parser.error("领奖模式不能与 --mode 或阅读诊断/历史参数同时使用")
+    return args
 
 
 async def _validate_curl_configs(config: WeReadConfig) -> None:
@@ -4923,9 +5463,14 @@ async def main() -> int:
     # 解析命令行参数
     args = parse_arguments()
     execution_mode = "normal"
+    gain_query = getattr(args, "gain_query", False)
+    gain_only = getattr(args, "gain_only", False)
+    gain_mode = gain_query or gain_only
     config = None
     run_started = False
-    if args.dry_run:
+    if gain_mode:
+        execution_mode = "gain-query" if gain_query else "gain-only"
+    elif args.dry_run:
         execution_mode = "dry-run"
     elif args.validate_config:
         execution_mode = "validate-config"
@@ -4943,16 +5488,28 @@ async def main() -> int:
         if args.mode == "scheduled" and croniter is None:
             required_deps.append("croniter")
 
+    if gain_mode and httpx is None:
+        required_deps.append("httpx")
+
     if required_deps:
-        print(f"❌ 缺少依赖: {', '.join(required_deps)}")
-        print("请安装: pip install -r requirements.txt")
+        if gain_mode:
+            logging.error(
+                "❌ 缺少依赖: %s，请安装 requirements.txt",
+                ", ".join(required_deps),
+            )
+        else:
+            print(f"❌ 缺少依赖: {', '.join(required_deps)}")
+            print("请安装: pip install -r requirements.txt")
         return 1
 
     curl_validated = False
 
     try:
         # 加载配置
-        config_manager = ConfigManager(args.config)
+        if gain_mode:
+            config_manager = ConfigManager(args.config, load_scope="gain")
+        else:
+            config_manager = ConfigManager(args.config)
         config = config_manager.config
 
         if args.show_last_run:
@@ -4965,6 +5522,9 @@ async def main() -> int:
 
         # 使用配置设置日志
         setup_logging(config.logging, verbose=args.verbose)
+
+        if gain_mode:
+            return await run_gain(config, query_only=gain_query)
 
         # 命令行参数覆盖配置文件
         if args.mode:
@@ -5014,7 +5574,14 @@ async def main() -> int:
         logging.info("👋 用户中断，程序退出")
         return 130
     except Exception as e:
-        error_msg = format_error_message("❌ 程序运行错误", e)
+        if gain_mode:
+            detail = (
+                str(e) if isinstance(e, (ConfigError, GainError))
+                else type(e).__name__
+            )
+            error_msg = f"❌ 领奖运行错误: {detail}"
+        else:
+            error_msg = format_error_message("❌ 程序运行错误", e)
         logging.error(error_msg)
 
         if run_started:

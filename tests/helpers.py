@@ -50,8 +50,11 @@ class FakeHttpClient:
         return response
 
     async def post_raw(
-        self, url, headers=None, cookies=None, json_data=None, data=None
+        self, url, headers=None, cookies=None, json_data=None, data=None,
+        before_send=None,
     ):
+        if before_send is not None:
+            before_send()
         self.raw_calls.append(
             {
                 "url": url,

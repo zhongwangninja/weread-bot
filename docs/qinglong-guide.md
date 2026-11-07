@@ -173,6 +173,24 @@ task -m 14400 funnyzak_weread-bot_main/weread-bot.py -- --mode immediate --confi
 
 如需不同账号在不同时段执行，分别创建只含一个用户的 YAML 和定时任务，用各自的 `--config` 指定。每份配置应使用不同的日志与历史文件路径，并移除或按任务覆盖共享的 `LOG_FILE` / `HISTORY_FILE` 环境变量，避免相互覆盖。
 
+## 独立每周领奖任务
+
+领奖不需要网页 CURL，仅支持一份应用端账号凭据，默认关闭。不要修改现有阅读任务，也不要加 `--mode`：
+
+1. 在 **环境变量** 添加 `GAIN_ENABLED=true`、`GAIN_REFRESH_TOKEN`、`GAIN_DEVICE_ID`，凭据从自己的应用端 `/login` 请求体获取，不能使用网页 Cookie。`GAIN_TYPE` 默认 `2`（书币），可显式改为 `1`（卡类奖励）。
+2. 创建单独的手动任务，先运行查询：
+
+   ```bash
+   task funnyzak_weread-bot_main/weread-bot.py -- --gain-query
+   ```
+
+3. 确认登录成功、档位与奖励选项可识别，再改成 `--gain-only`。首次建议仅有一个可领取档位时运行，并在 App 核实结果。
+4. 验证后可设置每天运行一次的常规定时，避开奖励过期的最后时刻。避免多个领奖任务重叠；停止任务不能撤销已经发送的领取请求。
+
+也可通过 `--config /ql/data/config/weread-gain.yaml` 使用只含 `gain`、`network`、`logging` 的本地配置。与阅读任务使用不同的 `LOG_FILE`，避免日志混写。关闭时不会联网；只查询会联网但不领取，与 `--dry-run` 的离线含义不同。
+
+领奖失败/部分失败/不支持所选奖励/待确认退出 `1`，只查询成功或领取已确认退出 `0`。所有应用端请求都不自动重试；“待确认”先到 App 检查，不反复重跑尝试。第一版无业务通知和历史记录，查看任务输出或配置的日志；凭据失效时手工更新，不持久化轮换的 RefreshToken。
+
 ## 查看结果与排错
 
 在 **定时任务 → 日志** 查看本次执行输出；程序日志和历史按上面的路径保存在持久化目录。把校验命令中的 `--validate-config` 换成 `--show-last-run`，可只读查看最近一次真实执行结果，YAML 方案保留相同的 `--config` 参数。
