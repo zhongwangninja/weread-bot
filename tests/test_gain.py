@@ -45,6 +45,18 @@ def response(payload: Any, status: int = 200) -> Tuple[httpx.Response, float]:
 LOGIN = {"accessToken": "fake-access", "vid": 42}
 
 
+def signed_login_fields() -> dict:
+    return {
+        "random": 7,
+        "signature": "0" * 64,
+        "timestamp": 1_700_000_000_000,
+    }
+
+
+def signed_login_environment() -> dict:
+    return {"GAIN_LOGIN_DATA": json.dumps(signed_login_fields())}
+
+
 class GainConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.bot = load_weread_bot()
@@ -65,6 +77,7 @@ class GainConfigTests(unittest.TestCase):
         ).config
         self.assertFalse(config.gain.enabled)
         self.assertEqual(config.gain.gain_type, 2)
+        self.assertEqual(config.gain.login_data, {})
         self.assertEqual(config.users, [])
 
     def test_credentials_do_not_implicitly_enable(self) -> None:
@@ -73,25 +86,31 @@ class GainConfigTests(unittest.TestCase):
             {
                 "GAIN_REFRESH_TOKEN": "fake-refresh",
                 "GAIN_DEVICE_ID": "fake-device",
+                **signed_login_environment(),
             },
         ):
             config = self.load("gain:\n  gain_type: 1\n")
         self.assertFalse(config.gain.enabled)
         self.assertEqual(config.gain.refresh_token, "")
+        self.assertEqual(config.gain.login_data, {})
 
     def test_disabled_credentials_and_choice_are_not_resolved(self) -> None:
         config = self.load(
             "gain:\n  enabled: false\n  gain_type: invalid\n"
             "  refresh_token: ${MISSING_GAIN_TOKEN}\n"
             "  device_id: ${MISSING_GAIN_DEVICE}\n"
+            "  login_data: ${MISSING_GAIN_LOGIN_DATA}\n"
         )
         self.assertFalse(config.gain.enabled)
 
     def test_reading_ignores_gain_and_gain_environment(self) -> None:
-        with patch.dict(os.environ, {"GAIN_ENABLED": "invalid"}):
+        with patch.dict(os.environ, {
+            "GAIN_ENABLED": "invalid", "GAIN_LOGIN_DATA": "invalid"
+        }):
             config = self.load(
                 "gain:\n  enabled: true\n"
-                "  refresh_token: ${MISSING_GAIN_TOKEN}\n",
+                "  refresh_token: ${MISSING_GAIN_TOKEN}\n"
+                "  login_data: ${MISSING_GAIN_LOGIN_DATA}\n",
                 "reading",
             )
         self.assertFalse(config.gain.enabled)
@@ -141,6 +160,7 @@ class GainConfigTests(unittest.TestCase):
                 "GAIN_REFRESH_TOKEN": "fake-refresh",
                 "GAIN_DEVICE_ID": "fake-device",
                 "GAIN_TYPE": "2",
+                **signed_login_environment(),
             },
         ):
             config = self.load(
@@ -148,10 +168,12 @@ class GainConfigTests(unittest.TestCase):
                 "  gain_type: ${MISSING_GAIN_TYPE}\n"
                 "  refresh_token: ${MISSING_GAIN_TOKEN}\n"
                 "  device_id: ${MISSING_GAIN_DEVICE}\n"
+                "  login_data: ${MISSING_GAIN_LOGIN_DATA}\n"
             )
         self.assertEqual(config.gain.refresh_token, "fake-refresh")
         self.assertEqual(config.gain.device_id, "fake-device")
         self.assertEqual(config.gain.gain_type, 2)
+        self.assertEqual(config.gain.login_data, signed_login_fields())
 
     def test_invalid_type_and_credentials_fail_safely(self) -> None:
         for extra, path in (
@@ -189,12 +211,73 @@ class GainConfigTests(unittest.TestCase):
                 "reading:\n  target_duration: ${MISSING_TIME}\n", "reading"
             )
 
+    def test_login_data_loads_yaml_and_normalizes_integers(self) -> None:
+        data = signed_login_fields()
+        data["random"] = str(data["random"])
+        data["timestamp"] = str(data["timestamp"])
+        with patch.dict(os.environ, {"GAIN_LOGIN_DATA": "  "}):
+            config = self.load(yaml.safe_dump({
+                "gain": {
+                    "enabled": True,
+                    "refresh_token": "fake-refresh",
+                    "device_id": "fake-device",
+                    "login_data": data,
+                },
+            }))
+        self.assertEqual(config.gain.login_data, signed_login_fields())
+
+    def test_multiline_json_login_data_is_accepted(self) -> None:
+        with patch.dict(os.environ, {
+            "GAIN_ENABLED": "true",
+            "GAIN_REFRESH_TOKEN": "fake-refresh",
+            "GAIN_DEVICE_ID": "fake-device",
+            "GAIN_LOGIN_DATA": json.dumps(signed_login_fields(), indent=2),
+        }):
+            config = self.bot.ConfigManager(
+                str(self.path), load_scope="gain"
+            ).config
+        self.assertEqual(config.gain.login_data, signed_login_fields())
+
+    def test_invalid_login_data_fails_without_exposing_values(self) -> None:
+        valid = signed_login_fields()
+        cases = (
+            '{"signature": "fake-private-signature"',
+            [],
+            None,
+            {"signature": valid["signature"]},
+            {"random": 7, "signature": valid["signature"]},
+            {**valid, "deviceId": "fake-private-device"},
+            {**valid, "signature": "fake-private-signature"},
+            {**valid, "random": True},
+            {**valid, "random": -1},
+            {**valid, "timestamp": True},
+            {**valid, "timestamp": 0},
+        )
+        for index, data in enumerate(cases):
+            with self.subTest(case=index), patch.dict(os.environ, {
+                "GAIN_ENABLED": "true",
+                "GAIN_REFRESH_TOKEN": "fake-refresh",
+                "GAIN_DEVICE_ID": "fake-device",
+                "GAIN_LOGIN_DATA": (
+                    data if isinstance(data, str) else json.dumps(data)
+                ),
+            }):
+                with self.assertRaises(self.bot.ConfigError) as caught:
+                    self.bot.ConfigManager(str(self.path), load_scope="gain")
+                message = str(caught.exception)
+                self.assertIn("gain.login_data", message)
+                self.assertNotIn(valid["signature"], message)
+                self.assertNotIn("fake-private-signature", message)
+                self.assertNotIn("fake-private-device", message)
+
     def test_gain_config_repr_hides_credentials(self) -> None:
         config = self.bot.GainConfig(
-            refresh_token="fake-refresh", device_id="fake-device"
+            refresh_token="fake-refresh", device_id="fake-device",
+            login_data=signed_login_fields(),
         )
         self.assertNotIn("fake-refresh", repr(config))
         self.assertNotIn("fake-device", repr(config))
+        self.assertNotIn(signed_login_fields()["signature"], repr(config))
 
 
 class GainFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -249,6 +332,69 @@ class GainFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(call["cookies"] is None for call in client.raw_calls)
         )
+
+    async def test_unsigned_login_uses_static_fields_and_current_timestamp(
+        self,
+    ) -> None:
+        manager, client = self.manager(response(LOGIN), response(weekly()))
+        with patch.object(self.bot.time, "time", return_value=1_700_000_000.125):
+            with self.assertLogs(level="WARNING") as captured:
+                result = await manager.run(query_only=True)
+        self.assertEqual(result.exit_code, 0)
+        body = client.raw_calls[0]["json_data"]
+        self.assertEqual(body["deviceId"], "fake-device")
+        self.assertEqual(body["refreshToken"], "fake-refresh")
+        self.assertEqual(body["wxToken"], 0)
+        self.assertEqual(body["timestamp"], 1_700_000_000_125)
+        for name in ("refCgi", "trackId", "virtualChannelId"):
+            self.assertEqual(body[name], "")
+        self.assertEqual(len(body), 10)
+        self.assertNotIn("random", body)
+        self.assertNotIn("signature", body)
+        self.assertIn("未配置手机端签名数据", "\n".join(captured.output))
+
+    async def test_signed_login_fields_are_preserved_and_only_sent_to_login(
+        self,
+    ) -> None:
+        fields = signed_login_fields()
+        self.config.gain.login_data = fields
+        item = award(level_id=13)
+        item["awardChoices"] = [
+            {"choiceType": 1, "awardNum": 2, "canChoice": 1},
+            {"choiceType": 2, "awardNum": 6, "canChoice": 1},
+        ]
+        claimed = {**item, "awardStatus": 2, "awardChooseType": 2}
+        manager, client = self.manager(
+            response(LOGIN), response(weekly(item)),
+            response({"succ": 1}), response(weekly(claimed)),
+        )
+        result = await manager.run()
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.confirmed, [13])
+        body = client.raw_calls[0]["json_data"]
+        self.assertEqual(len(body), 12)
+        for name, value in fields.items():
+            self.assertEqual(body[name], value)
+            self.assertEqual(self.config.gain.login_data[name], value)
+        for call in client.raw_calls[1:]:
+            self.assertTrue(
+                set(signed_login_fields()).isdisjoint(call["json_data"])
+            )
+        self.assertEqual(
+            self.claims(client)[0]["json_data"]["awardChoiceType"], 2
+        )
+
+    async def test_external_signature_requires_original_timestamp(self) -> None:
+        self.config.gain.login_data = {
+            "random": 7, "signature": signed_login_fields()["signature"]
+        }
+        manager, client = self.manager()
+        result = await manager.run(query_only=True)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("gain.login_data", result.error)
+        self.assertIn("timestamp", result.error)
+        self.assertNotIn(signed_login_fields()["signature"], result.error)
+        self.assertEqual(client.raw_calls, [])
 
     async def test_claim_is_confirmed_by_second_query(self) -> None:
         manager, client = self.manager(
@@ -882,6 +1028,10 @@ class GainWorkflowTests(unittest.TestCase):
             self.runtime["env"]["GAIN_DEVICE_ID"],
             "${{ secrets.GAIN_DEVICE_ID }}",
         )
+        self.assertEqual(
+            self.runtime["env"]["GAIN_LOGIN_DATA"],
+            "${{ secrets.GAIN_LOGIN_DATA }}",
+        )
         self.assertNotIn("secrets.", self.runtime["run"])
         self.assertNotIn("WEREAD_CURL", str(self.workflow))
         self.assertNotIn("continue-on-error", self.runtime)
@@ -889,6 +1039,7 @@ class GainWorkflowTests(unittest.TestCase):
             if step is not self.runtime:
                 self.assertNotIn("GAIN_REFRESH_TOKEN", step.get("env", {}))
                 self.assertNotIn("GAIN_DEVICE_ID", step.get("env", {}))
+                self.assertNotIn("GAIN_LOGIN_DATA", step.get("env", {}))
         artifact = next(
             step
             for step in self.steps

@@ -265,6 +265,7 @@ gain:
   gain_type: 2
   refresh_token: ""
   device_id: ""
+  login_data: {}
 ```
 
 | YAML 配置 | 环境变量 | 默认值 | 说明 |
@@ -273,8 +274,36 @@ gain:
 | `gain.gain_type` | `GAIN_TYPE` | `2` | `2`=书币，`1`=卡类奖励（以服务端描述为准） |
 | `gain.refresh_token` | `GAIN_REFRESH_TOKEN` | 空 | 应用端 RefreshToken |
 | `gain.device_id` | `GAIN_DEVICE_ID` | 空 | 与 RefreshToken 配对的 DeviceId |
+| `gain.login_data` | `GAIN_LOGIN_DATA` | `{}` | YAML 对象或 JSON 对象字符串，仅含配套的 `timestamp`、`random`、`signature` |
 
-凭据需从自己的手机/墨水屏微信读书应用端 `https://i.weread.qq.com/login` 请求体获取，不能用网页 Cookie 替代。只保存到本地配置或环境变量，不提交到仓库，不分享完整登录响应。当前使用墨水屏版 1.9.3 的客户端请求格式；未经你的账号与网络环境实测，不保证兼容或长期有效。
+凭据需从自己的手机/墨水屏微信读书应用端 `https://i.weread.qq.com/login` 请求体获取，不能用网页 Cookie 替代。只保存到本地配置或环境变量，不提交到仓库，不分享完整登录响应。当前客户端请求头和 `deviceName` 使用手机端 10.2.2 的格式；未经你的账号与网络环境实测，不保证兼容或长期有效。
+
+登录请求已补齐手机端的静态字段 `refCgi: ""`、`trackId: ""`、`virtualChannelId: ""`、`wxToken: 0`。未签名请求的 `timestamp` 由 `int(time.time() * 1000)` 自动生成；Unix 时间戳与时区无关，北京时间仅用于显示，不需要额外加 8 小时。
+
+手机签名算法尚未实现，不能假定旧签名可以配合新时间戳复用。外部签名通过一个 `GAIN_LOGIN_DATA` JSON 对象成组提供，必须同时且仅包含正整数毫秒时间戳 `timestamp`、非负整数 `random`、64 位十六进制 `signature`。时间戳必须使用生成该签名时的原始值，不会自动替换成当前时间。三字段须与本次凭据及请求对应；过期时须更新整个 JSON，不能把抓包值固定复用为每周定时登录方案。未配置时发送未签名登录并提示警告，不保证手机端接受。签名仅用于登录，不会发往领奖接口，日志与配置错误会脱敏。
+
+<a id="gain-local-debug"></a>
+
+#### 本地环境变量调试（bash/zsh）
+
+在仓库根目录、已安装 `requirements.txt` 依赖的 Python 环境中运行。下面只示意 JSON 结构，数值及全零签名不是有效登录数据；请用同一次最新 `/login` 抓包中的三字段整组替换：
+
+```json
+{"timestamp":1700000000000,"random":7,"signature":"0000000000000000000000000000000000000000000000000000000000000000"}
+```
+
+通过隐藏输入设置变量，避免将凭据写入 shell 历史。每次输入原始值并按回车，不加外层引号；`GAIN_LOGIN_DATA` 粘贴一行完整 JSON：
+
+```bash
+export GAIN_ENABLED=true GAIN_TYPE=2
+printf 'GAIN_REFRESH_TOKEN: '; IFS= read -r -s GAIN_REFRESH_TOKEN; printf '\n'
+printf 'GAIN_DEVICE_ID: '; IFS= read -r -s GAIN_DEVICE_ID; printf '\n'
+printf 'GAIN_LOGIN_DATA: '; IFS= read -r -s GAIN_LOGIN_DATA; printf '\n'
+export GAIN_REFRESH_TOKEN GAIN_DEVICE_ID GAIN_LOGIN_DATA
+python3 weread-bot.py --config /dev/null --gain-query
+```
+
+`/dev/null` 作为空配置，避免读取现有 YAML；变量只在当前终端会话及其子进程内生效，不自动加载 `.env`。命令会联网登录并查询，但不领取；登录可能影响当前手机会话。不要回显 JSON 或签名，调试后可执行 `unset GAIN_LOGIN_DATA GAIN_REFRESH_TOKEN GAIN_DEVICE_ID`。原来的三个独立签名变量不再读取。
 
 显式开启并配置凭据后，先查询，再决定是否领取：
 

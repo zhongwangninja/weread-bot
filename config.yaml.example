@@ -20,6 +20,8 @@ gain:
   gain_type: 2               # 2=书币（默认），1=卡类；不支持所选奖励时不回退。GAIN_TYPE
   refresh_token: ""          # 建议通过 GAIN_REFRESH_TOKEN 环境变量提供
   device_id: ""              # 与 RefreshToken 配对，通过 GAIN_DEVICE_ID 提供
+  login_data: {}             # 配套的 timestamp、random、signature；GAIN_LOGIN_DATA 为 JSON 对象字符串
+  # 三字段须来自同一份有效签名数据；不生成/刷新签名，不替换原时间戳，勿提交或回显。
 
 # 以下 CURL 配置只用于网页阅读（支持单用户和多用户模式），独立领奖不读取。
 curl_config:

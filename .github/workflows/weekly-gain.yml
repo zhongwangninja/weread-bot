@@ -44,6 +44,7 @@ jobs:
           GAIN_TYPE: ${{ vars.GAIN_TYPE || '2' }}
           GAIN_REFRESH_TOKEN: ${{ secrets.GAIN_REFRESH_TOKEN }}
           GAIN_DEVICE_ID: ${{ secrets.GAIN_DEVICE_ID }}
+          GAIN_LOGIN_DATA: ${{ secrets.GAIN_LOGIN_DATA }}
           LOG_FILE: logs/weekly-gain.log
           LOG_FORMAT: json
           LOG_LEVEL: INFO

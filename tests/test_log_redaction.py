@@ -20,6 +20,7 @@ class LogRedactionTests(unittest.IsolatedAsyncioTestCase):
             "pc": "pc-super-secret",
             "bot_token": "bot-super-secret",
             "webhook_url": "https://example.test/secret-hook",
+            "signature": "fake-login-signature",
         }
         redacted = self.bot.redact_for_log(secret_values)
         rendered = repr(redacted)
@@ -62,6 +63,14 @@ class LogRedactionTests(unittest.IsolatedAsyncioTestCase):
 
         payload = json.loads(stream.getvalue())
         self.assertNotIn("unique-json-secret", payload["message"])
+
+    def test_redacts_login_data_and_request_signature(self) -> None:
+        signature = "0" * 64
+        data = {"signature": signature, "random": 7, "timestamp": 1}
+        rendered = repr(self.bot.redact_for_log({"login_data": data}))
+        self.assertNotIn(signature, rendered)
+        text = self.bot.redact_for_log(json.dumps(data))
+        self.assertNotIn(signature, text)
 
     def test_missing_identity_warning_does_not_echo_other_identity(self):
         session = object.__new__(self.bot.WeReadSessionManager)

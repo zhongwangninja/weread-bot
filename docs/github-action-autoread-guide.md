@@ -16,12 +16,23 @@
 |------|------|------|
 | Secret | `GAIN_REFRESH_TOKEN` | 自己的应用端 RefreshToken，可从 `/login` 请求体或成功响应获取 |
 | Secret | `GAIN_DEVICE_ID` | 与上述 Token 配对的 DeviceId |
+| Secret | `GAIN_LOGIN_DATA` | 可选，JSON 对象字符串，仅含同一份签名数据的 `timestamp`、`random`、`signature`；程序不生成或刷新签名 |
 | Secret | `APPRISE_URL` | 可选，复用自动阅读的 Apprise 通知 URL；未配置则跳过通知 |
 | Secret | `NOTIFICATION_ONLY_ON_FAILURE` | 可选，复用自动阅读的开关，默认 `false`；设为 `true` 时只通知失败/中断等非成功结果 |
 | Variable | `GAIN_ENABLED` | 可选，默认 `true`；设为小写 `false` 停止后续手动和定时领奖 job |
 | Variable | `GAIN_TYPE` | 可选，默认 `2`（书币），`1` 为卡类奖励 |
 
-配置凭据后，进入 **Actions → Weekly Rewards → Run workflow** 即可执行领取，无需填写调试参数。手动和定时运行都使用仓库 `GAIN_TYPE`，会先查询，再领取所有可领取且支持所选奖励的档位，不自动回退到另一种奖励。只想查询时，请在开发版本中使用独立 CLI 的 `--gain-query`，此正式 workflow 不提供查询模式。
+#### `GAIN_LOGIN_DATA` Secret 示例
+
+点击 **New repository secret**，名称填 `GAIN_LOGIN_DATA`，值直接填写 JSON，不加 `export` 或外层引号。以下只示意格式，数值及全零签名不是有效登录数据；三字段都须替换为同一次最新 `/login` 请求中的真实值：
+
+```json
+{"timestamp":1700000000000,"random":7,"signature":"0000000000000000000000000000000000000000000000000000000000000000"}
+```
+
+`timestamp`、`random` 使用 JSON 数字，`signature` 使用字符串。三个独立签名变量已改为此单个 JSON Secret，不再读取旧变量。GitHub 对 JSON 内部字段的自动脱敏[并不可靠](https://docs.github.com/en/actions/reference/security/secure-use)；程序会脱敏 `signature` 和 `login_data`，但仍不要在 workflow 中回显原始 JSON 或单独的签名。本地隐藏输入设置环境变量的方法见 [README](../README.md#gain-local-debug)。
+
+配置可用的登录数据后，进入 **Actions → Weekly Rewards → Run workflow** 执行领取，无需填写调试参数。手机签名算法尚未实现；未配置签名 JSON 时发送未签名登录并自动使用当前 Unix 毫秒时间戳，不保证手机端接受。JSON 中的三字段须与本次凭据及请求对应，时间戳不会自动换成当前时间；过期后需更新整个 Secret，固定抓包值不能作为长期定时登录方案。手动和定时运行都使用仓库 `GAIN_TYPE`，会先查询，再领取所有可领取且支持所选奖励的档位，不自动回退到另一种奖励。只想查询时，请在开发版本中使用独立 CLI 的 `--gain-query`，此正式 workflow 不提供查询模式。
 
 workflow 使用环境变量运行，不生成含凭据的配置，不读取仓库里的阅读配置。凭据 Secret 仅注入领取步骤，不输出原值，也不上传登录响应/配置。任务结束后尽力上传 `logs/weekly-gain.log`，保留 7 天，不生成领奖历史文件。失败、部分失败、跳过不支持的奖励或待确认使 job 失败，请检查日志；回查确认的是档位状态，不要只凭绿色状态认定余额增加。
 

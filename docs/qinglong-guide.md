@@ -177,7 +177,7 @@ task -m 14400 funnyzak_weread-bot_main/weread-bot.py -- --mode immediate --confi
 
 领奖不需要网页 CURL，仅支持一份应用端账号凭据，默认关闭。不要修改现有阅读任务，也不要加 `--mode`：
 
-1. 在 **环境变量** 添加 `GAIN_ENABLED=true`、`GAIN_REFRESH_TOKEN`、`GAIN_DEVICE_ID`，凭据从自己的应用端 `/login` 请求体获取，不能使用网页 Cookie。`GAIN_TYPE` 默认 `2`（书币），可显式改为 `1`（卡类奖励）。
+1. 在 **环境变量** 添加 `GAIN_ENABLED=true`、`GAIN_REFRESH_TOKEN`、`GAIN_DEVICE_ID`，凭据从自己的应用端 `/login` 请求体获取，不能使用网页 Cookie。`GAIN_TYPE` 默认 `2`（书币），可显式改为 `1`（卡类奖励）。手机端如要求签名，可通过 `GAIN_LOGIN_DATA` 提供仅含 `timestamp`、`random`、`signature` 的 JSON 对象字符串；三字段须来自同一份签名数据，并与当前凭据及请求对应。未签名请求自动使用当前 Unix 毫秒时间戳；外部签名 JSON 的时间戳不会被替换。程序不生成或刷新签名，不适合固定复用抓包值作为定时登录方案。
 2. 创建单独的手动任务，先运行查询：
 
    ```bash

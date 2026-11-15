@@ -157,7 +157,7 @@ SENSITIVE_LOG_KEYS = {
     "authorization", "cookie", "cookies", "wr_skey", "token", "bot_token",
     "webhook_url", "secret", "ps", "pc", "sendkey", "pushkey", "device_key",
     "refreshtoken", "refresh_token", "accesstoken", "access_token",
-    "deviceid", "device_id", "vid",
+    "deviceid", "device_id", "vid", "signature", "login_data",
 }
 SENSITIVE_LOG_KEY_PATTERN = "|".join(
     sorted((re.escape(key) for key in SENSITIVE_LOG_KEYS), key=len, reverse=True)
@@ -474,6 +474,7 @@ class GainConfig:
     gain_type: int = 2
     refresh_token: str = field(default="", repr=False)
     device_id: str = field(default="", repr=False)
+    login_data: Dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -775,7 +776,8 @@ class ConfigError(ValueError):
 def _config_error(path: str, reason: str, value: Any) -> ConfigError:
     safe_value = repr(value)
     if any(key in path.lower() for key in (
-        "token", "cookie", "secret", "content", "device_id", "deviceid"
+        "token", "cookie", "secret", "content", "device_id", "deviceid",
+        "signature", "login_data",
     )):
         safe_value = "已提供" if value else "未提供"
     return ConfigError(f"{path}: {reason}，当前值={safe_value}")
@@ -887,6 +889,35 @@ def validate_network_logging_config(config: WeReadConfig) -> None:
     parse_int(config.logging.backup_count, "logging.backup_count", 0)
 
 
+def parse_gain_login_data(value: Any) -> Dict[str, Any]:
+    """解析配套签名字段，不生成或改写签名及其时间戳。"""
+    path = "gain.login_data"
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            raise _config_error(path, "必须是合法 JSON 对象", value) from None
+    if not isinstance(value, dict):
+        raise _config_error(path, "必须是对象映射", value)
+    if not value:
+        return {}
+    if set(value) != {"timestamp", "random", "signature"}:
+        raise _config_error(
+            path, "必须同时且仅包含 timestamp、random、signature", value
+        )
+    signature = value["signature"]
+    if (not isinstance(signature, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", signature)):
+        raise _config_error(
+            f"{path}.signature", "必须是 64 位十六进制字符串", signature
+        )
+    return {
+        "timestamp": parse_int(value["timestamp"], f"{path}.timestamp", 1),
+        "random": parse_int(value["random"], f"{path}.random", 0),
+        "signature": signature,
+    }
+
+
 def validate_gain_config(config: GainConfig) -> None:
     """启用领奖时才要求合法奖励类型和应用端凭据。"""
     config.enabled = parse_bool(config.enabled, "gain.enabled")
@@ -901,6 +932,7 @@ def validate_gain_config(config: GainConfig) -> None:
         value = getattr(config, name)
         if not isinstance(value, str) or not value.strip():
             raise _config_error(f"gain.{name}", "必须是非空字符串", value)
+    config.login_data = parse_gain_login_data(config.login_data)
 
 
 def validate_config_semantics(config: WeReadConfig) -> None:
@@ -1027,6 +1059,7 @@ class ConfigManager:
                 ("gain_type", "GAIN_TYPE"),
                 ("refresh_token", "GAIN_REFRESH_TOKEN"),
                 ("device_id", "GAIN_DEVICE_ID"),
+                ("login_data", "GAIN_LOGIN_DATA"),
             ):
                 override = self._get_env_override(env_key)
                 value = (
@@ -1283,6 +1316,10 @@ class ConfigManager:
             device_id=self._get_config_value(
                 config_data, "gain.device_id", "GAIN_DEVICE_ID", ""
             ),
+            login_data=parse_gain_login_data(self._get_config_value(
+                config_data, "gain.login_data", "GAIN_LOGIN_DATA",
+                defaults.login_data,
+            )),
         )
 
     def _load_network_config(self, config_data: dict) -> NetworkConfig:
@@ -2103,14 +2140,14 @@ GAIN_EXCHANGE_URL = "https://i.weread.qq.com/weekly/exchange"
 GAIN_PF = "wechat_wx-2001-android-100-weread"
 GAIN_DEVICE_HEADERS = {
     "User-Agent": (
-        "WeRead/1.9.3 WRBrand/null wr_eink Dalvik/2.1.0 "
-        "(Linux; U; Android 14)"
+        "WeRead/10.2.2 WRBrand/xiaomi Dalvik/2.1.0 "
+        "(Linux; U; Android 17; 24129PN74C Build/CP2A.260605.016)"
     ),
-    "baseapi": "34",
-    "appver": "1.9.3.10244349",
-    "osver": "14",
-    "channelid": "990",
-    "basever": "1.9.3.10244349",
+    "baseapi": "37",
+    "appver": "10.2.2.10167650",
+    "osver": "17",
+    "channelid": "12",
+    "basever": "10.2.2.10167650",
 }
 GAIN_AWARD_GROUPS = ("readtimeAwards", "readdayAwards", "readgoalAwards")
 
@@ -2265,15 +2302,27 @@ class GainManager:
         return data
 
     async def _login(self) -> None:
+        body = {
+            "deviceId": self.config.gain.device_id,
+            "deviceName": "xiaomi",
+            "refreshToken": self._refresh_token,
+            "inBackground": 0,
+            "kickType": 1,
+            "refCgi": "",
+            "trackId": "",
+            "virtualChannelId": "",
+            "wxToken": 0,
+        }
+        if self.config.gain.login_data:
+            body.update(self.config.gain.login_data)
+        else:
+            body["timestamp"] = int(time.time() * 1000)
+            logging.warning(
+                "未配置手机端签名数据，本次发送未签名登录请求；"
+                "无法保证兼容手机 App"
+            )
         data = await self._request_json(
-            "登录", GAIN_LOGIN_URL, GAIN_DEVICE_HEADERS,
-            {
-                "deviceId": self.config.gain.device_id,
-                "deviceName": "微信阅读器(第二代)",
-                "refreshToken": self._refresh_token,
-                "inBackground": 0,
-                "kickType": 1,
-            },
+            "登录", GAIN_LOGIN_URL, GAIN_DEVICE_HEADERS, body,
         )
         token = data.get("accessToken")
         vid = _gain_int(data.get("vid"))
