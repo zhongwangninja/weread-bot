@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Tuple
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -1058,6 +1058,7 @@ class GainWorkflowTests(unittest.TestCase):
             self.notification["env"],
             {
                 "APPRISE_URL": "${{ secrets.APPRISE_URL }}",
+                "APPRISE_URL_BAK": "${{ secrets.APPRISE_URL_BAK }}",
                 "NOTIFICATION_ONLY_ON_FAILURE": (
                     "${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}"
                 ),
@@ -1074,22 +1075,26 @@ class GainWorkflowTests(unittest.TestCase):
         outcome: str = "success",
         only_failure: str = "false",
         url: str = "test://notification-placeholder",
+        backup_url: str = "",
         cli_exit: int = 0,
-    ) -> Tuple[subprocess.CompletedProcess, Optional[dict]]:
+    ) -> Tuple[subprocess.CompletedProcess, List[dict]]:
         with tempfile.TemporaryDirectory() as directory:
-            capture = Path(directory) / "capture.json"
+            capture = Path(directory) / "capture.jsonl"
             cli = Path(directory) / "apprise"
-            # 假 CLI 只记录调用，并故意输出 URL 来验证 workflow 的脱敏。
+            # 假 CLI 逐次记录调用，并故意输出 URL 来验证 workflow 的脱敏。
             cli.write_text(
                 f"#!{sys.executable}\n"
                 "import json\n"
                 "import os\n"
                 "import sys\n"
                 "from pathlib import Path\n"
-                "Path(os.environ['APPRISE_CAPTURE']).write_text(json.dumps({\n"
-                "    'argv': sys.argv[1:],\n"
-                "    'urls': os.environ.get('APPRISE_URLS'),\n"
-                "}), encoding='utf-8')\n"
+                "with Path(os.environ['APPRISE_CAPTURE']).open(\n"
+                "    'a', encoding='utf-8'\n"
+                ") as capture:\n"
+                "    capture.write(json.dumps({\n"
+                "        'argv': sys.argv[1:],\n"
+                "        'urls': os.environ.get('APPRISE_URLS'),\n"
+                "    }) + '\\n')\n"
                 "sys.stdout.write(os.environ['APPRISE_URLS'])\n"
                 "sys.stderr.write(os.environ['APPRISE_URLS'])\n"
                 "sys.exit(int(os.environ['APPRISE_EXIT']))\n",
@@ -1112,6 +1117,7 @@ class GainWorkflowTests(unittest.TestCase):
                     "APPRISE_CAPTURE": str(capture),
                     "APPRISE_EXIT": str(cli_exit),
                     "APPRISE_URL": url,
+                    "APPRISE_URL_BAK": backup_url,
                     "NOTIFICATION_ONLY_ON_FAILURE": only_failure,
                     "GAIN_OUTCOME": outcome,
                     "GITHUB_REPOSITORY": "test-owner/test-repo",
@@ -1125,25 +1131,31 @@ class GainWorkflowTests(unittest.TestCase):
                 timeout=10,
                 check=False,
             )
-            call = (
-                json.loads(capture.read_text(encoding="utf-8"))
+            calls = (
+                [
+                    json.loads(line)
+                    for line in capture.read_text(encoding="utf-8").splitlines()
+                ]
                 if capture.exists()
-                else None
+                else []
             )
             self.assertNotIn("notification-placeholder", result.stdout)
             self.assertNotIn("notification-placeholder", result.stderr)
-            return result, call
+            self.assertNotIn("backup-placeholder", result.stdout)
+            self.assertNotIn("backup-placeholder", result.stderr)
+            return result, calls
 
     def test_notification_without_url_skips_cli(self) -> None:
-        result, call = self.run_notification(url="")
+        result, calls = self.run_notification(url="")
         self.assertEqual(result.returncode, 0)
-        self.assertIsNone(call)
+        self.assertEqual(calls, [])
         self.assertEqual(result.stdout, "")
 
     def test_success_notification_uses_env_url_and_safe_run_link(self) -> None:
-        result, call = self.run_notification()
+        result, calls = self.run_notification()
         self.assertEqual(result.returncode, 0)
-        self.assertIsNotNone(call)
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
         self.assertEqual(call["urls"], "test://notification-placeholder")
         self.assertEqual(
             call["argv"][:3],
@@ -1164,19 +1176,68 @@ class GainWorkflowTests(unittest.TestCase):
         self.assertNotIn("fake-device", str(call["argv"]))
         self.assertIn("Apprise 通知已发送", result.stdout)
 
+    def test_backup_channel_receives_additional_notification(self) -> None:
+        result, calls = self.run_notification(
+            backup_url="test://backup-placeholder"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            [call["urls"] for call in calls],
+            [
+                "test://notification-placeholder",
+                "test://backup-placeholder",
+            ],
+        )
+        self.assertEqual(calls[0]["argv"], calls[1]["argv"])
+        self.assertIn("APPRISE_URL", result.stdout)
+        self.assertIn("APPRISE_URL_BAK", result.stdout)
+
+    def test_backup_channel_is_optional(self) -> None:
+        result, calls = self.run_notification(backup_url="")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("APPRISE_URL_BAK", result.stdout)
+
+    def test_backup_channel_works_without_primary_url(self) -> None:
+        result, calls = self.run_notification(
+            url="", backup_url="test://backup-placeholder"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            [call["urls"] for call in calls], ["test://backup-placeholder"]
+        )
+
+    def test_backup_channel_is_attempted_after_primary_failure(self) -> None:
+        result, calls = self.run_notification(
+            backup_url="test://backup-placeholder", cli_exit=1
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            [call["urls"] for call in calls],
+            [
+                "test://notification-placeholder",
+                "test://backup-placeholder",
+            ],
+        )
+        self.assertIn("Apprise 通知失败（APPRISE_URL", result.stdout)
+        self.assertIn("Apprise 通知失败（APPRISE_URL_BAK", result.stdout)
+
     def test_only_failure_skips_success_notification(self) -> None:
         for value in ("true", "True", "TRUE", "1", "yes", "YES", "on", "On"):
             with self.subTest(value=value):
-                result, call = self.run_notification(only_failure=value)
+                result, calls = self.run_notification(
+                    only_failure=value,
+                    backup_url="test://backup-placeholder",
+                )
                 self.assertEqual(result.returncode, 0)
-                self.assertIsNone(call)
+                self.assertEqual(calls, [])
 
     def test_failure_notifies_even_when_only_failure_is_enabled(self) -> None:
-        result, call = self.run_notification(
+        result, calls = self.run_notification(
             outcome="failure", only_failure="true"
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn("失败、部分失败或待确认", call["argv"][3])
+        self.assertIn("失败、部分失败或待确认", calls[0]["argv"][3])
 
     def test_cancelled_and_skipped_steps_do_not_report_success(self) -> None:
         for outcome, message in (
@@ -1184,16 +1245,16 @@ class GainWorkflowTests(unittest.TestCase):
             ("skipped", "领奖步骤未执行"),
         ):
             with self.subTest(outcome=outcome):
-                result, call = self.run_notification(
+                result, calls = self.run_notification(
                     outcome=outcome, only_failure="true"
                 )
                 self.assertEqual(result.returncode, 0)
-                self.assertIn(message, call["argv"][3])
-                self.assertNotIn("领奖任务成功", call["argv"][3])
+                self.assertIn(message, calls[0]["argv"][3])
+                self.assertNotIn("领奖任务成功", calls[0]["argv"][3])
 
     def test_notification_failure_hides_raw_cli_output(self) -> None:
-        result, call = self.run_notification(cli_exit=1)
-        self.assertIsNotNone(call)
+        result, calls = self.run_notification(cli_exit=1)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr, "")
         self.assertIn("Apprise 通知失败", result.stdout)

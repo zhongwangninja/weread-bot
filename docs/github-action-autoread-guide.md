@@ -17,7 +17,8 @@
 | Secret | `GAIN_REFRESH_TOKEN` | 自己的应用端 RefreshToken，可从 `/login` 请求体或成功响应获取 |
 | Secret | `GAIN_DEVICE_ID` | 与上述 Token 配对的 DeviceId |
 | Secret | `GAIN_LOGIN_DATA` | 可选，JSON 对象字符串，仅含同一份签名数据的 `timestamp`、`random`、`signature`；程序不生成或刷新签名 |
-| Secret | `APPRISE_URL` | 可选，复用自动阅读的 Apprise 通知 URL；未配置则跳过通知 |
+| Secret | `APPRISE_URL` | 可选，复用自动阅读的 Apprise 通知 URL；未配置则跳过该渠道 |
+| Secret | `APPRISE_URL_BAK` | 可选，第二个 Apprise 通知 URL（如备用渠道）；与 `APPRISE_URL` 独立发送，未配置则跳过该渠道 |
 | Secret | `NOTIFICATION_ONLY_ON_FAILURE` | 可选，复用自动阅读的开关，默认 `false`；设为 `true` 时只通知失败/中断等非成功结果 |
 | Variable | `GAIN_ENABLED` | 可选，默认 `true`；设为小写 `false` 停止后续手动和定时领奖 job |
 | Variable | `GAIN_TYPE` | 可选，默认 `2`（书币），`1` 为卡类奖励 |
@@ -40,7 +41,7 @@ workflow 使用环境变量运行，不生成含凭据的配置，不读取仓�
 
 通知步骤复用现有依赖中的 Apprise CLI，支持 Apprise 各类通知 URL。通知包含任务结果、仓库名和 Actions 运行链接，详细档位结果查看脱敏日志。URL 仅从环境变量传入，不写入文件或命令参数，第三方通知原始输出也不会进入 Actions 日志。
 
-`NOTIFICATION_ONLY_ON_FAILURE=true` 时跳过成功通知；未配置 `APPRISE_URL` 时安静跳过。通知步骤尽力在任务结束后执行，失败不会改变领取步骤的结果，也不会重试领取。独立 CLI 本身仍不发送通知。
+`NOTIFICATION_ONLY_ON_FAILURE=true` 时跳过成功通知；`APPRISE_URL` 和 `APPRISE_URL_BAK` 都未配置时安静跳过。配置两个 URL 时会各发一次相同通知，二者互不影响：一个渠道发送失败仍会尝试另一个渠道，任一渠道失败时通知步骤失败（`continue-on-error: true`，不改变领取步骤的结果）。通知步骤尽力在任务结束后执行，也不会重试领取。独立 CLI 本身仍不发送通知。
 
 ### 定时与开发分支业务版本
 
