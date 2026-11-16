@@ -1245,6 +1245,20 @@ class GainWorkflowTests(unittest.TestCase):
         self.assertIn("Apprise 通知失败（APPRISE_URL", result.stdout)
         self.assertIn("Apprise 通知失败（APPRISE_URL_BAK", result.stdout)
 
+    def test_serverchan_channel_uses_markdown_paragraphs(self) -> None:
+        result, calls = self.run_notification(
+            backup_url="schan://schan-placeholder-token"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        plain_body = calls[0]["argv"][3]
+        markdown_body = calls[1]["argv"][3]
+        self.assertIn("状态：success\n本次新领取", plain_body)
+        self.assertIn("状态：success\n\n本次新领取", markdown_body)
+        self.assertIn("异常：无\n\n—— 档位明细 ——", markdown_body)
+        self.assertNotIn("schan-placeholder-token", result.stdout)
+        self.assertNotIn("schan-placeholder-token", result.stderr)
+
     def test_only_failure_skips_success_notification(self) -> None:
         for value in ("true", "True", "TRUE", "1", "yes", "YES", "on", "On"):
             with self.subTest(value=value):

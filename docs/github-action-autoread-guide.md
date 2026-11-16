@@ -39,7 +39,7 @@ workflow 使用环境变量运行，不生成含凭据的配置，不读取仓�
 
 ### Apprise 通知
 
-通知步骤复用现有依赖中的 Apprise CLI，支持 Apprise 各类通知 URL。通知包含任务结果、档位明细、仓库名和 Actions 运行链接；更详细的原始记录查看脱敏日志。URL 仅从环境变量传入，不写入文件或命令参数，第三方通知原始输出也不会进入 Actions 日志。
+通知步骤复用现有依赖中的 Apprise CLI，支持 Apprise 各类通知 URL。通知包含任务结果、档位明细、仓库名和 Actions 运行链接；更详细的原始记录查看脱敏日志。ServerChan（`schan://`）会把正文按 Markdown 渲染，单换行会折叠为空格，因此该渠道自动改用空行分段的正文；其他渠道保持纯文本格式。URL 仅从环境变量传入，不写入文件或命令参数，第三方通知原始输出也不会进入 Actions 日志。
 
 `NOTIFICATION_ONLY_ON_FAILURE=true` 时跳过成功通知；`APPRISE_URL` 和 `APPRISE_URL_BAK` 都未配置时安静跳过。配置两个 URL 时会各发一次相同通知，二者互不影响：一个渠道发送失败仍会尝试另一个渠道，任一渠道失败时通知步骤失败（`continue-on-error: true`，不改变领取步骤的结果）。通知步骤尽力在任务结束后执行，也不会重试领取。独立 CLI 本身仍不发送通知。
 
