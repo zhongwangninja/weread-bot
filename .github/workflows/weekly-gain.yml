@@ -56,12 +56,13 @@ jobs:
         timeout-minutes: 2
         env:
           APPRISE_URL: ${{ secrets.APPRISE_URL }}
+          APPRISE_URL_BAK: ${{ secrets.APPRISE_URL_BAK }}
           NOTIFICATION_ONLY_ON_FAILURE: ${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}
           GAIN_OUTCOME: ${{ steps.claim.outcome }}
           GAIN_LOG_FILE: logs/weekly-gain.log
         run: |
-          if [ -z "$APPRISE_URL" ]; then
-            echo "未配置 APPRISE_URL，跳过通知"
+          if [ -z "$APPRISE_URL" ] && [ -z "$APPRISE_URL_BAK" ]; then
+            echo "未配置 APPRISE_URL/APPRISE_URL_BAK，跳过通知"
             exit 0
           fi
 
@@ -284,15 +285,24 @@ jobs:
             exit 0
           fi
 
-          # Apprise CLI 从环境变量读取 URL，不写文件或将 URL 放到命令参数。
-          export APPRISE_URLS="$APPRISE_URL"
-          if apprise --title "$(cat "$MAIL_DIR/title.txt")" \
-              --body "$(cat "$MAIL_DIR/body.txt")" >/dev/null 2>&1; then
-            printf '%s\n' 'Apprise 通知已发送'
-          else
-            printf '%s\n' 'Apprise 通知失败（通知 URL 和原始错误已隐藏）'
-            exit 1
-          fi
+          # 各渠道独立发送；某个渠道失败不阻止其余渠道的尝试。
+          failed=0
+          for channel in APPRISE_URL APPRISE_URL_BAK; do
+            url="${!channel}"
+            if [ -z "$url" ]; then
+              continue
+            fi
+            # Apprise CLI 从环境变量读取 URL，不写文件或将 URL 放到命令参数。
+            export APPRISE_URLS="$url"
+            if apprise --title "$(cat "$MAIL_DIR/title.txt")" \
+                --body "$(cat "$MAIL_DIR/body.txt")" >/dev/null 2>&1; then
+              printf 'Apprise 通知已发送（%s）\n' "$channel"
+            else
+              printf 'Apprise 通知失败（%s，通知 URL 和原始错误已隐藏）\n' "$channel"
+              failed=1
+            fi
+          done
+          exit "$failed"
 
       - name: Upload redacted reward log
         if: always()
