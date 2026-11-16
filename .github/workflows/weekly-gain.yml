@@ -59,26 +59,232 @@ jobs:
           APPRISE_URL_BAK: ${{ secrets.APPRISE_URL_BAK }}
           NOTIFICATION_ONLY_ON_FAILURE: ${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}
           GAIN_OUTCOME: ${{ steps.claim.outcome }}
+          GAIN_LOG_FILE: logs/weekly-gain.log
         run: |
           if [ -z "$APPRISE_URL" ] && [ -z "$APPRISE_URL_BAK" ]; then
+            echo "未配置 APPRISE_URL/APPRISE_URL_BAK，跳过通知"
             exit 0
           fi
-          case "$NOTIFICATION_ONLY_ON_FAILURE" in
-            [tT][rR][uU][eE]|1|[yY][eE][sS]|[oO][nN])
-              if [ "$GAIN_OUTCOME" = "success" ]; then
-                exit 0
-              fi
-              ;;
-          esac
-          case "$GAIN_OUTCOME" in
-            success) result='领奖任务成功：档位已确认或没有可领取奖励。' ;;
-            failure) result='领奖任务失败、部分失败或待确认，请查看脱敏日志。' ;;
-            cancelled) result='领奖任务已中断，请在 App 核实在途请求。' ;;
-            *) result='领奖步骤未执行，请检查 workflow 的前置步骤。' ;;
-          esac
-          printf -v body '%s\n仓库：%s\n运行记录：%s/%s/actions/runs/%s' \
-            "$result" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" \
-            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+
+          # 先清空输出目录，避免复用 runner 时沿用上一次的标题和正文。
+          MAIL_DIR=/tmp/weread-gain-mail
+          rm -rf "$MAIL_DIR"
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import pathlib
+          import re
+
+          RESULT_RE = re.compile(r"🎁 (?:领奖|查询)结果: status=(\S+)")
+          LIST_FIELDS = ("confirmed", "already_claimed", "failed", "skipped", "unknown")
+          LIST_RES = {
+              name: re.compile(rf"{name}=\[([^\]]*)\]") for name in LIST_FIELDS
+          }
+          LEVEL_RE = re.compile(r"档位 (\d+): status=(\d+)")
+          CLAIMED_RE = re.compile(r"🎁 档位 (\d+) 已领取")
+          PENDING_RE = re.compile(r"档位 (\d+) 待确认")
+          SKIPPED_RE = re.compile(r"🎁 档位 (\d+) 不支持所选奖励")
+
+          log_path = pathlib.Path(
+              os.environ.get("GAIN_LOG_FILE", "logs/weekly-gain.log")
+          )
+          out_dir = pathlib.Path("/tmp/weread-gain-mail")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          title_path = out_dir / "title.txt"
+          body_path = out_dir / "body.txt"
+          for path in (title_path, body_path):
+              path.unlink(missing_ok=True)
+
+          records = []
+          if log_path.exists():
+              for raw_line in log_path.read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines():
+                  raw_line = raw_line.strip()
+                  if not raw_line:
+                      continue
+                  try:
+                      record = json.loads(raw_line)
+                  except json.JSONDecodeError:
+                      record = {"message": raw_line}
+                  if isinstance(record, dict):
+                      records.append((
+                          str(record.get("level", "")),
+                          str(record.get("message", "")),
+                      ))
+
+          status = None
+          lists = {name: [] for name in LIST_FIELDS}
+          initial_status = {}
+          claimed = set()
+          pending = set()
+          skipped_levels = set()
+          errors = []
+
+          for level, message in records:
+              match = RESULT_RE.search(message)
+              if match:
+                  status = match.group(1)
+                  for name, pattern in LIST_RES.items():
+                      found = pattern.search(message)
+                      if found:
+                          lists[name] = [
+                              int(item)
+                              for item in re.findall(r"\d+", found.group(1))
+                          ]
+                  continue
+              match = LEVEL_RE.search(message)
+              if match:
+                  initial_status[int(match.group(1))] = int(match.group(2))
+                  continue
+              match = CLAIMED_RE.search(message)
+              if match:
+                  claimed.add(int(match.group(1)))
+                  continue
+              match = PENDING_RE.search(message)
+              if match:
+                  pending.add(int(match.group(1)))
+                  continue
+              match = SKIPPED_RE.search(message)
+              if match:
+                  skipped_levels.add(int(match.group(1)))
+                  continue
+              if level == "ERROR" and message.startswith("🎁 "):
+                  errors.append(message[2:].strip())
+
+          level_ids = set(initial_status) | claimed | pending | skipped_levels
+          for name in LIST_FIELDS:
+              level_ids.update(lists[name])
+
+          detail = {
+              level_id: ("无可领取奖励" if value == 0 else "未处理")
+              for level_id, value in initial_status.items()
+          }
+          for level_id in skipped_levels:
+              detail[level_id] = "已跳过（不支持所选奖励或状态未知）"
+          for level_id in pending:
+              detail[level_id] = "待确认，请在 App 核查"
+          for level_id in claimed:
+              detail[level_id] = "本次已领取"
+          for level_id in lists["failed"]:
+              detail[level_id] = "领取失败"
+          for level_id in lists["skipped"]:
+              detail[level_id] = "已跳过（不支持所选奖励或状态未知）"
+          for level_id in lists["unknown"]:
+              detail[level_id] = "待确认，请在 App 核查"
+          for level_id in lists["already_claimed"]:
+              detail[level_id] = "此前已领取"
+          for level_id in lists["confirmed"]:
+              detail[level_id] = "本次已领取"
+
+          def fmt(ids):
+              ordered = sorted(set(ids))
+              return "档位 " + ", ".join(str(item) for item in ordered) if ordered else "无"
+
+          def fmt_count(ids):
+              ordered = sorted(set(ids))
+              if not ordered:
+                  return "0 个"
+              return f"{len(ordered)} 个（{fmt(ordered)}）"
+
+          new_claims = len(set(lists["confirmed"]))
+          issue_count = sum(
+              len(set(lists[name]))
+              for name in ("failed", "skipped", "unknown")
+          )
+          manual = sorted(set(lists["failed"]) | set(lists["unknown"]))
+          outcome = os.environ.get("GAIN_OUTCOME", "").strip()
+
+          if status == "success":
+              emoji = "✅"
+              verdict = "✅ 全部正常"
+              suffix = f"新领 {new_claims} 个" if new_claims else "无需领取"
+          elif status == "partial_success":
+              emoji = "⚠️"
+              verdict = "⚠️ 部分成功"
+              suffix = f"已领 {new_claims}，异常 {issue_count}"
+          elif status == "cancelled":
+              emoji = "⏹️"
+              verdict = "⏹️ 已中断"
+              suffix = "已中断"
+          elif status == "failed":
+              emoji = "❌"
+              verdict = "❌ 失败"
+              suffix = "失败"
+          else:
+              emoji = "❌"
+              verdict = "❌ 结果未知"
+              suffix = "未找到领奖结果"
+              if outcome:
+                  suffix = f"未找到领奖结果，退出状态 {outcome}"
+
+          if (
+              os.environ.get("NOTIFICATION_ONLY_ON_FAILURE", "false")
+              .strip().lower()
+              in {"true", "1", "yes", "on"}
+              and status == "success"
+              and not errors
+          ):
+              print("仅失败时通知：本次结果正常，跳过通知")
+              raise SystemExit(0)
+
+          server_url = os.environ.get("GITHUB_SERVER_URL", "")
+          repository = os.environ.get("GITHUB_REPOSITORY", "")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          run_url = (
+              f"{server_url}/{repository}/actions/runs/{run_id}"
+              if server_url and repository and run_id else "（未提供）"
+          )
+
+          lines = [
+              f"结果：{verdict}",
+              f"状态：{status or '未知'}",
+              f"本次新领取：{fmt_count(lists['confirmed'])}",
+              f"此前已领取：{fmt_count(lists['already_claimed'])}",
+          ]
+          issue_parts = []
+          if lists["failed"]:
+              issue_parts.append(f"领取失败 {fmt(lists['failed'])}")
+          if lists["unknown"]:
+              issue_parts.append(f"待确认 {fmt(lists['unknown'])}")
+          if lists["skipped"]:
+              issue_parts.append(f"跳过 {fmt(lists['skipped'])}")
+          lines.append("异常：" + ("；".join(issue_parts) if issue_parts else "无"))
+          if manual:
+              lines.append(f"需人工核实：{fmt(manual)}（请在 App 中确认领取状态）")
+          if errors:
+              lines.extend(["", "—— 附加信息 ——"])
+              lines.extend(f"错误：{item}" for item in errors)
+
+          lines.extend([
+              "",
+              "—— 档位明细 ——",
+          ])
+          if detail:
+              width = max(len(str(item)) for item in detail)
+              lines.extend(
+                  f"档位 {str(level_id).ljust(width)}  {detail[level_id]}"
+                  for level_id in sorted(detail)
+              )
+          else:
+              lines.append("（日志中未找到档位信息）")
+          lines.extend([
+              "",
+              f"仓库：{repository or '（未提供）'}",
+              f"运行记录：{run_url}",
+          ])
+
+          title_path.write_text(
+              f"{emoji} 微信读书每周领奖报告（{suffix}）", encoding="utf-8"
+          )
+          body_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print(f"通知判定：{verdict}，新领取 {new_claims} 个")
+          PYEOF
+
+          if [ ! -f "$MAIL_DIR/title.txt" ]; then
+            exit 0
+          fi
+
           # 各渠道独立发送；某个渠道失败不阻止其余渠道的尝试。
           failed=0
           for channel in APPRISE_URL APPRISE_URL_BAK; do
@@ -88,7 +294,8 @@ jobs:
             fi
             # Apprise CLI 从环境变量读取 URL，不写文件或将 URL 放到命令参数。
             export APPRISE_URLS="$url"
-            if apprise --title '微信读书每周领奖报告' --body "$body" >/dev/null 2>&1; then
+            if apprise --title "$(cat "$MAIL_DIR/title.txt")" \
+                --body "$(cat "$MAIL_DIR/body.txt")" >/dev/null 2>&1; then
               printf 'Apprise 通知已发送（%s）\n' "$channel"
             else
               printf 'Apprise 通知失败（%s，通知 URL 和原始错误已隐藏）\n' "$channel"

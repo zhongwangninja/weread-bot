@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -1063,6 +1063,7 @@ class GainWorkflowTests(unittest.TestCase):
                     "${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || 'false' }}"
                 ),
                 "GAIN_OUTCOME": "${{ steps.claim.outcome }}",
+                "GAIN_LOG_FILE": "logs/weekly-gain.log",
             },
         )
         self.assertNotIn("secrets.", self.notification["run"])
@@ -1077,8 +1078,28 @@ class GainWorkflowTests(unittest.TestCase):
         url: str = "test://notification-placeholder",
         backup_url: str = "",
         cli_exit: int = 0,
+        log_records: Optional[List[dict]] = None,
     ) -> Tuple[subprocess.CompletedProcess, List[dict]]:
+        if log_records is None:
+            log_records = [
+                {
+                    "level": "INFO",
+                    "message": "🎁 档位 1: status=1, 可选奖励={2: 1}",
+                },
+                {
+                    "level": "INFO",
+                    "message": (
+                        "🎁 领奖结果: status=success confirmed=[1] "
+                        "already_claimed=[] failed=[] skipped=[] unknown=[]"
+                    ),
+                },
+            ]
         with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "weekly-gain.log"
+            log_path.write_text(
+                "\n".join(json.dumps(record) for record in log_records) + "\n",
+                encoding="utf-8",
+            )
             capture = Path(directory) / "capture.jsonl"
             cli = Path(directory) / "apprise"
             # 假 CLI 逐次记录调用，并故意输出 URL 来验证 workflow 的脱敏。
@@ -1113,13 +1134,16 @@ class GainWorkflowTests(unittest.TestCase):
                     self.notification["run"],
                 ],
                 env={
-                    "PATH": f"{directory}:{os.defpath}",
+                    "PATH": (
+                        f"{directory}:{Path(sys.executable).parent}:{os.defpath}"
+                    ),
                     "APPRISE_CAPTURE": str(capture),
                     "APPRISE_EXIT": str(cli_exit),
                     "APPRISE_URL": url,
                     "APPRISE_URL_BAK": backup_url,
                     "NOTIFICATION_ONLY_ON_FAILURE": only_failure,
                     "GAIN_OUTCOME": outcome,
+                    "GAIN_LOG_FILE": str(log_path),
                     "GITHUB_REPOSITORY": "test-owner/test-repo",
                     "GITHUB_SERVER_URL": "https://github.com",
                     "GITHUB_RUN_ID": "123",
@@ -1149,24 +1173,26 @@ class GainWorkflowTests(unittest.TestCase):
         result, calls = self.run_notification(url="")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(calls, [])
-        self.assertEqual(result.stdout, "")
+        self.assertIn("未配置 APPRISE_URL/APPRISE_URL_BAK", result.stdout)
 
-    def test_success_notification_uses_env_url_and_safe_run_link(self) -> None:
+    def test_success_notification_uses_log_summary_and_safe_run_link(
+        self,
+    ) -> None:
         result, calls = self.run_notification()
         self.assertEqual(result.returncode, 0)
         self.assertEqual(len(calls), 1)
         call = calls[0]
         self.assertEqual(call["urls"], "test://notification-placeholder")
-        self.assertEqual(
-            call["argv"][:3],
-            [
-                "--title",
-                "微信读书每周领奖报告",
-                "--body",
-            ],
+        self.assertEqual(call["argv"][0], "--title")
+        self.assertTrue(
+            call["argv"][1].startswith("✅ 微信读书每周领奖报告")
         )
+        self.assertEqual(call["argv"][2], "--body")
         self.assertEqual(len(call["argv"]), 4)
-        self.assertIn("领奖任务成功", call["argv"][3])
+        self.assertIn("结果：✅ 全部正常", call["argv"][3])
+        self.assertIn("状态：success", call["argv"][3])
+        self.assertIn("本次新领取：1 个（档位 1）", call["argv"][3])
+        self.assertIn("档位 1  本次已领取", call["argv"][3])
         self.assertIn(
             "https://github.com/test-owner/test-repo/actions/runs/123",
             call["argv"][3],
@@ -1234,23 +1260,56 @@ class GainWorkflowTests(unittest.TestCase):
 
     def test_failure_notifies_even_when_only_failure_is_enabled(self) -> None:
         result, calls = self.run_notification(
-            outcome="failure", only_failure="true"
+            outcome="failure",
+            only_failure="true",
+            log_records=[
+                {
+                    "level": "INFO",
+                    "message": "🎁 档位 1: status=1, 可选奖励={2: 1}",
+                },
+                {
+                    "level": "INFO",
+                    "message": (
+                        "🎁 领奖结果: status=partial_success confirmed=[] "
+                        "already_claimed=[] failed=[1] skipped=[] unknown=[]"
+                    ),
+                },
+            ],
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn("失败、部分失败或待确认", calls[0]["argv"][3])
+        self.assertIn("结果：⚠️ 部分成功", calls[0]["argv"][3])
+        self.assertIn("领取失败 档位 1", calls[0]["argv"][3])
+        self.assertIn("需人工核实", calls[0]["argv"][3])
 
     def test_cancelled_and_skipped_steps_do_not_report_success(self) -> None:
-        for outcome, message in (
-            ("cancelled", "领奖任务已中断"),
-            ("skipped", "领奖步骤未执行"),
+        cancelled_log = [
+            {
+                "level": "INFO",
+                "message": (
+                    "🎁 领奖结果: status=cancelled confirmed=[] "
+                    "already_claimed=[] failed=[] skipped=[] unknown=[]"
+                ),
+            },
+        ]
+        for outcome, records, title_text, body_text in (
+            ("cancelled", cancelled_log, "已中断", "结果：⏹️ 已中断"),
+            (
+                "skipped",
+                [],
+                "未找到领奖结果，退出状态 skipped",
+                "结果：❌ 结果未知",
+            ),
         ):
             with self.subTest(outcome=outcome):
                 result, calls = self.run_notification(
-                    outcome=outcome, only_failure="true"
+                    outcome=outcome,
+                    only_failure="true",
+                    log_records=records,
                 )
                 self.assertEqual(result.returncode, 0)
-                self.assertIn(message, calls[0]["argv"][3])
-                self.assertNotIn("领奖任务成功", calls[0]["argv"][3])
+                self.assertIn(title_text, calls[0]["argv"][1])
+                self.assertIn(body_text, calls[0]["argv"][3])
+                self.assertNotIn("全部正常", calls[0]["argv"][3])
 
     def test_notification_failure_hides_raw_cli_output(self) -> None:
         result, calls = self.run_notification(cli_exit=1)
