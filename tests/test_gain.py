@@ -969,25 +969,22 @@ class GainWorkflowTests(unittest.TestCase):
         self.assertNotIn("inputs.", str(self.workflow))
         self.assertEqual(job["timeout-minutes"], "10")
 
-    def test_schedules_are_sunday_three_and_twelve_in_beijing(self) -> None:
+    def test_schedule_is_sunday_three_in_beijing(self) -> None:
         crons = [entry["cron"] for entry in self.workflow["on"]["schedule"]]
-        self.assertEqual(crons, ["0 19 * * 6", "0 4 * * 0"])
-        beijing = timezone(timedelta(hours=8))
-        for cron, day, hour in zip(crons, (7, 8), (3, 12)):
-            with self.subTest(cron=cron):
-                minute, utc_hour, _, _, weekday = cron.split()
-                utc = datetime(
-                    2026,
-                    11,
-                    day,
-                    int(utc_hour),
-                    int(minute),
-                    tzinfo=timezone.utc,
-                )
-                self.assertEqual(utc.isoweekday() % 7, int(weekday))
-                local = utc.astimezone(beijing)
-                self.assertEqual(local.isoweekday(), 7)
-                self.assertEqual((local.hour, local.minute), (hour, 0))
+        self.assertEqual(crons, ["0 19 * * 6"])
+        minute, utc_hour, _, _, weekday = crons[0].split()
+        utc = datetime(
+            2026,
+            11,
+            7,
+            int(utc_hour),
+            int(minute),
+            tzinfo=timezone.utc,
+        )
+        self.assertEqual(utc.isoweekday() % 7, int(weekday))
+        local = utc.astimezone(timezone(timedelta(hours=8)))
+        self.assertEqual(local.isoweekday(), 7)
+        self.assertEqual((local.hour, local.minute), (3, 0))
 
     def test_reading_schedule_is_daily_one_in_beijing(self) -> None:
         path = self.root / ".github/workflows/auto-reading-scheduled.yml"

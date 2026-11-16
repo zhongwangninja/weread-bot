@@ -4,7 +4,6 @@ on:
   workflow_dispatch: {}
   schedule:
     - cron: '0 19 * * 6'  # UTC 周六 19:00 = 北京时间周日 03:00
-    - cron: '0 4 * * 0'   # UTC 周日 04:00 = 北京时间周日 12:00
 
 permissions:
   contents: read

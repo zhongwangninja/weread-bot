@@ -6,7 +6,7 @@
 
 ## 独立每周领奖 Actions
 
-`Weekly Rewards`（`.github/workflows/weekly-gain.yml`）与下面的自动阅读 workflow 完全独立，不需要 `WEREAD_CURL_STRING`。此 workflow 默认启用、直接领取，定时为**北京时间每周日 03:00 和 12:00**；不在 PR 或 push 时运行，现有自动阅读任务不会自动领奖。独立 CLI 和 `config.yaml.example` 的 `gain.enabled` 默认仍为 `false`，仅此 workflow 显式传入启用值。
+`Weekly Rewards`（`.github/workflows/weekly-gain.yml`）与下面的自动阅读 workflow 完全独立，不需要 `WEREAD_CURL_STRING`。此 workflow 默认启用、直接领取，定时为**北京时间每周日 03:00**；不在 PR 或 push 时运行，现有自动阅读任务不会自动领奖。独立 CLI 和 `config.yaml.example` 的 `gain.enabled` 默认仍为 `false`，仅此 workflow 显式传入启用值。
 
 ### 配置与运行
 
@@ -49,7 +49,6 @@ workflow 使用环境变量运行，不生成含凭据的配置，不读取仓�
 |------|----------|----------|
 | 自动阅读（`auto-reading-scheduled.yml`） | 每天 01:00 | `0 17 * * *` |
 | 独立领奖（`weekly-gain.yml`） | 每周日 03:00 | `0 19 * * 6` |
-| 独立领奖（`weekly-gain.yml`） | 每周日 12:00 | `0 4 * * 0` |
 
 定时触发要求 workflow 存在于默认分支。观察期可以**只将 workflow 合并到 `main`，不合并领奖业务代码**：领奖 workflow 的 `actions/checkout.ref` 指向 `feat/standalone-weekly-gain`，每次运行都会检出该分支最新推送的业务代码，无需更新 workflow 中的 ref。请先测试再推送，该分支的新代码会影响下一次自动领奖；分支需持续保留。仅在 Run workflow 选择其他分支不会覆盖这里指定的业务分支。修改开发分支的 workflow 文件不会自动更新 `main` 的定时定义，仍需单独合并相应 workflow 改动。
 
@@ -356,7 +355,7 @@ A: 是的，GitHub 免费账户每月有 2000 分钟的 Actions 使用时间。�
 
 ### Q: 如何设置定时运行？
 
-A: `.github/workflows/auto-reading-scheduled.yml` 已配置北京时间每天 01:00 运行，合并到默认分支并启用 Actions 即可；修改 cron 时注意使用 UTC，避免再启用另一份重复定时配置。独立领奖为北京时间每周日 03:00 和 12:00，见上文。如果只想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
+A: `.github/workflows/auto-reading-scheduled.yml` 已配置北京时间每天 01:00 运行，合并到默认分支并启用 Actions 即可；修改 cron 时注意使用 UTC，避免再启用另一份重复定时配置。独立领奖为北京时间每周日 03:00，见上文。如果只想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
 
 ### Q: GitHub Actions 里的执行历史保存在哪里？
 
